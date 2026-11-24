@@ -1,0 +1,2339 @@
+/* =====================================================================
+   Propi Facturación - despliegue LOCAL en un solo archivo
+   Reemplaza a run_all.sql: NO necesita modo SQLCMD (sin directivas de SQLCMD),
+   así que corre tal cual en SSMS, Azure Data Studio o DBeaver.
+   Orden: 00 base -> 01 tablas -> 02 catálogos -> 03 cifrado -> 04 triggers
+          -> 05 CRUD -> 06 reportes -> 07 roles/permisos -> 09 datos de prueba
+   (08_indices.sql no existe todavía; agregarlo antes de 09 o después, según REQ 009)
+
+   Requisitos: SQL Server 2017 o superior (STRING_AGG, CREATE OR ALTER, JSON),
+   ejecutar con un login sysadmin.
+   Es idempotente; para empezar de cero ejecute antes reset_local.sql.
+   Guardado en UTF-8 con BOM para que se vean bien tildes y ñ.
+   ===================================================================== */
+SET NOCOUNT ON;
+GO
+SET NOEXEC OFF;
+GO
+IF TRY_CONVERT(INT, PARSENAME(CONVERT(VARCHAR(20), SERVERPROPERTY('ProductVersion')), 4)) < 14
+BEGIN
+    PRINT N'ERROR: se requiere SQL Server 2017 o superior. Se detiene el script.';
+    SET NOEXEC ON;
+END
+GO
+
+/* >>>>>>>>>> 00_crear_base_datos.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Curso    : IF-0010 Bases de Datos II - UCR, Recinto de Paraíso (G22)
+   Script   : 00_crear_base_datos.sql
+   Propósito: Crea la base de datos PropiFacturacion (idempotente) y deja
+              configuradas las opciones que exige el resto del proyecto.
+   Notas    : - Usa la ruta de datos/log por defecto de CADA instancia, así
+                funciona igual en la máquina de ambos integrantes.
+              - No borra nada. Para empezar de cero usar reset_local.sql
+   ===================================================================== */
+USE master;
+GO
+
+IF DB_ID(N'PropiFacturacion') IS NULL
+BEGIN
+    DECLARE @ruta_datos NVARCHAR(512) = CONVERT(NVARCHAR(512), SERVERPROPERTY('InstanceDefaultDataPath'));
+    DECLARE @ruta_log   NVARCHAR(512) = CONVERT(NVARCHAR(512), SERVERPROPERTY('InstanceDefaultLogPath'));
+    DECLARE @sql        NVARCHAR(MAX);
+
+    SET @sql = N'CREATE DATABASE PropiFacturacion
+        ON PRIMARY
+        (
+            NAME       = N''PropiFacturacion_data'',
+            FILENAME   = N''' + @ruta_datos + N'PropiFacturacion.mdf'',
+            SIZE       = 128MB,
+            FILEGROWTH = 64MB
+        )
+        LOG ON
+        (
+            NAME       = N''PropiFacturacion_log'',
+            FILENAME   = N''' + @ruta_log + N'PropiFacturacion_log.ldf'',
+            SIZE       = 64MB,
+            FILEGROWTH = 64MB
+        );';
+
+    EXEC (@sql);
+    PRINT 'Base de datos PropiFacturacion creada.';
+END
+ELSE
+    PRINT 'La base de datos PropiFacturacion ya existe (se conserva).';
+GO
+
+/* ---------------------------------------------------------------------
+   Opciones de la base de datos
+   --------------------------------------------------------------------- */
+
+-- Nivel de compatibilidad de SQL Server 2022
+-- Nivel de compatibilidad = el de la instancia local (160 en SQL Server 2022,
+-- 150 en 2019, 140 en 2017). Antes estaba fijo en 160 y fallaba en versiones anteriores.
+DECLARE @nivel INT = (SELECT compatibility_level FROM sys.databases WHERE name = N'model');
+DECLARE @cmd NVARCHAR(200) = N'ALTER DATABASE PropiFacturacion SET COMPATIBILITY_LEVEL = ' + CONVERT(NVARCHAR(3), @nivel) + N';';
+EXEC (@cmd);
+GO
+
+-- Modelo de recuperación FULL: requerido por la política de respaldos (REQ 013),
+-- backups de log y la réplica / log shipping (REQ 014).
+-- OJO: la cadena de log solo empieza a funcionar tras el primer BACKUP FULL.
+ALTER DATABASE PropiFacturacion SET RECOVERY FULL;
+GO
+
+-- Aislamiento de lectura por versiones (justificación en REQ 007):
+-- las lecturas de reportes no bloquean a las escrituras de facturación.
+IF EXISTS (SELECT 1 FROM sys.databases
+           WHERE name = N'PropiFacturacion'
+             AND (is_read_committed_snapshot_on = 0 OR snapshot_isolation_state = 0))
+BEGIN
+    -- ROLLBACK IMMEDIATE cierra otras conexiones abiertas a la BD (solo entorno local).
+    ALTER DATABASE PropiFacturacion SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+    ALTER DATABASE PropiFacturacion SET ALLOW_SNAPSHOT_ISOLATION ON;
+END
+GO
+
+ALTER DATABASE PropiFacturacion SET AUTO_UPDATE_STATISTICS ON;
+ALTER DATABASE PropiFacturacion SET AUTO_CREATE_STATISTICS ON;
+ALTER DATABASE PropiFacturacion SET PAGE_VERIFY CHECKSUM;
+GO
+
+PRINT '00_crear_base_datos.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 01_esquemas_y_tablas.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 01_esquemas_y_tablas.sql
+   Propósito: Crea esquemas y las 9 tablas del modelo (REQ 001).
+              Incluye PK, FK, UNIQUE, DEFAULT y CHECK con nombre explícito.
+   Idempotente: se puede ejecutar varias veces sin error.
+
+   Esquemas
+     fact : negocio (clientes, impuestos, productos, facturas, notas)
+     seg  : seguridad (bitácora de acceso, REQ 003)
+     aud  : auditoría (bitácora de cambios, REQ 005)
+
+   Correcciones respecto al primer avance
+     - Cliente.nom_provincia (antes cod_provincia en el diccionario).
+     - BitacoraAuditoria.cod_guid: UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID().
+     - BitacoraAuditoria.cod_usuario: VARCHAR (CHAR rellenaba con espacios).
+     - BitacoraAuditoria.cod_sesion_usuario: VARCHAR(64) (SESSION_CONTEXT
+       devuelve sql_variant; la app genera un identificador de sesión).
+     - Factura: CHECK mon_total = mon_subtotal + mon_total_impuestos.
+     - Producto.cod_cabys: CHECK de 13 dígitos numéricos.
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+/* ---------------------------------------------------------------------
+   Esquemas
+   --------------------------------------------------------------------- */
+IF SCHEMA_ID(N'fact') IS NULL EXEC (N'CREATE SCHEMA fact AUTHORIZATION dbo;');
+GO
+IF SCHEMA_ID(N'seg')  IS NULL EXEC (N'CREATE SCHEMA seg AUTHORIZATION dbo;');
+GO
+IF SCHEMA_ID(N'aud')  IS NULL EXEC (N'CREATE SCHEMA aud AUTHORIZATION dbo;');
+GO
+
+/* ---------------------------------------------------------------------
+   fact.TipoIdentificacion  (catálogo)
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'fact.TipoIdentificacion', N'U') IS NULL
+BEGIN
+    CREATE TABLE fact.TipoIdentificacion
+    (
+        cod_tipo_identificacion TINYINT     NOT NULL
+            CONSTRAINT PK_TipoIdentificacion PRIMARY KEY,
+        des_tipo_identificacion VARCHAR(50) NOT NULL
+            CONSTRAINT UQ_TipoIdentificacion_des UNIQUE,
+        ind_estado              CHAR(1)     NOT NULL
+            CONSTRAINT DF_TipoIdentificacion_estado DEFAULT ('A')
+            CONSTRAINT CK_TipoIdentificacion_estado CHECK (ind_estado IN ('A','I'))
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   fact.Cliente
+   Campos sensibles (REQ 006) se guardan cifrados como VARBINARY.
+   hash_identificacion = SHA-256 de (tipo + '|' + número normalizado);
+   permite garantizar unicidad y buscar sin descifrar.
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'fact.Cliente', N'U') IS NULL
+BEGIN
+    CREATE TABLE fact.Cliente
+    (
+        cod_cliente              INT            NOT NULL IDENTITY(1,1)
+            CONSTRAINT PK_Cliente PRIMARY KEY,
+        nom_cliente              VARCHAR(150)   NOT NULL
+            CONSTRAINT CK_Cliente_nombre CHECK (LEN(LTRIM(RTRIM(nom_cliente))) > 0),
+        cod_tipo_identificacion  TINYINT        NOT NULL
+            CONSTRAINT FK_Cliente_TipoIdentificacion
+            FOREIGN KEY REFERENCES fact.TipoIdentificacion (cod_tipo_identificacion),
+        num_identificacion_cif   VARBINARY(256) NOT NULL,
+        hash_identificacion      VARBINARY(32)  NOT NULL
+            CONSTRAINT UQ_Cliente_hash_identificacion UNIQUE,
+        nom_provincia            VARCHAR(50)    NOT NULL,
+        nom_canton               VARCHAR(50)    NOT NULL,
+        nom_distrito             VARCHAR(50)    NOT NULL,
+        nom_barrio               VARCHAR(80)    NULL,
+        des_profesion            VARCHAR(100)   NULL,
+        des_actividad_economica  VARCHAR(150)   NULL,
+        des_correo_cif           VARBINARY(512) NOT NULL,
+        num_telefono_cif         VARBINARY(256) NULL,
+        fec_registro             DATETIME       NOT NULL
+            CONSTRAINT DF_Cliente_fec_registro DEFAULT (GETDATE()),
+        ind_estado               CHAR(1)        NOT NULL
+            CONSTRAINT DF_Cliente_estado DEFAULT ('A')
+            CONSTRAINT CK_Cliente_estado CHECK (ind_estado IN ('A','I'))
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   fact.TipoImpuesto
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'fact.TipoImpuesto', N'U') IS NULL
+BEGIN
+    CREATE TABLE fact.TipoImpuesto
+    (
+        cod_tipo_impuesto INT           NOT NULL IDENTITY(1,1)
+            CONSTRAINT PK_TipoImpuesto PRIMARY KEY,
+        cod_impuesto      VARCHAR(10)   NOT NULL
+            CONSTRAINT UQ_TipoImpuesto_cod UNIQUE,
+        des_impuesto      VARCHAR(100)  NOT NULL,
+        por_impuesto      DECIMAL(5,2)  NOT NULL
+            CONSTRAINT CK_TipoImpuesto_porcentaje CHECK (por_impuesto BETWEEN 0 AND 100),
+        mon_tarifa        DECIMAL(18,2) NOT NULL
+            CONSTRAINT DF_TipoImpuesto_tarifa DEFAULT (0)
+            CONSTRAINT CK_TipoImpuesto_tarifa CHECK (mon_tarifa >= 0),
+        ind_estado        CHAR(1)       NOT NULL
+            CONSTRAINT DF_TipoImpuesto_estado DEFAULT ('A')
+            CONSTRAINT CK_TipoImpuesto_estado CHECK (ind_estado IN ('A','I'))
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   fact.Producto  (productos y servicios, código CABYS de 13 dígitos)
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'fact.Producto', N'U') IS NULL
+BEGIN
+    CREATE TABLE fact.Producto
+    (
+        cod_producto      INT           NOT NULL IDENTITY(1,1)
+            CONSTRAINT PK_Producto PRIMARY KEY,
+        cod_cabys         VARCHAR(13)   NOT NULL
+            CONSTRAINT UQ_Producto_cabys UNIQUE
+            CONSTRAINT CK_Producto_cabys CHECK (LEN(cod_cabys) = 13 AND cod_cabys NOT LIKE '%[^0-9]%'),
+        des_producto      VARCHAR(200)  NOT NULL,
+        des_unidad_medida VARCHAR(20)   NOT NULL,
+        mon_precio        DECIMAL(18,2) NOT NULL
+            CONSTRAINT CK_Producto_precio CHECK (mon_precio >= 0),
+        cod_tipo_impuesto INT           NOT NULL
+            CONSTRAINT FK_Producto_TipoImpuesto
+            FOREIGN KEY REFERENCES fact.TipoImpuesto (cod_tipo_impuesto),
+        ind_estado        CHAR(1)       NOT NULL
+            CONSTRAINT DF_Producto_estado DEFAULT ('A')
+            CONSTRAINT CK_Producto_estado CHECK (ind_estado IN ('A','I'))
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   fact.Factura
+   ind_condicion_venta : C contado, R crédito
+   ind_medio_pago      : E efectivo, T tarjeta, Q cheque, F transferencia,
+                         S SINPE móvil, O otros
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'fact.Factura', N'U') IS NULL
+BEGIN
+    CREATE TABLE fact.Factura
+    (
+        num_factura         INT            NOT NULL IDENTITY(1,1)
+            CONSTRAINT PK_Factura PRIMARY KEY,
+        cod_cliente         INT            NOT NULL
+            CONSTRAINT FK_Factura_Cliente
+            FOREIGN KEY REFERENCES fact.Cliente (cod_cliente),
+        fec_factura         DATETIME       NOT NULL
+            CONSTRAINT DF_Factura_fecha DEFAULT (GETDATE()),
+        ind_condicion_venta CHAR(1)        NOT NULL
+            CONSTRAINT CK_Factura_condicion CHECK (ind_condicion_venta IN ('C','R')),
+        ind_medio_pago      CHAR(1)        NOT NULL
+            CONSTRAINT CK_Factura_medio_pago CHECK (ind_medio_pago IN ('E','T','Q','F','S','O')),
+        cod_moneda          CHAR(3)        NOT NULL
+            CONSTRAINT DF_Factura_moneda DEFAULT ('CRC')
+            CONSTRAINT CK_Factura_moneda CHECK (cod_moneda IN ('CRC','USD')),
+        mon_tipo_cambio     DECIMAL(10,4)  NOT NULL
+            CONSTRAINT DF_Factura_tipo_cambio DEFAULT (1)
+            CONSTRAINT CK_Factura_tipo_cambio CHECK (mon_tipo_cambio > 0),
+        des_observaciones   VARCHAR(500)   NULL,
+        mon_subtotal        DECIMAL(18,2)  NOT NULL
+            CONSTRAINT DF_Factura_subtotal DEFAULT (0)
+            CONSTRAINT CK_Factura_subtotal CHECK (mon_subtotal >= 0),
+        mon_total_impuestos DECIMAL(18,2)  NOT NULL
+            CONSTRAINT DF_Factura_impuestos DEFAULT (0)
+            CONSTRAINT CK_Factura_impuestos CHECK (mon_total_impuestos >= 0),
+        mon_total           DECIMAL(18,2)  NOT NULL
+            CONSTRAINT DF_Factura_total DEFAULT (0)
+            CONSTRAINT CK_Factura_total_pos CHECK (mon_total >= 0),
+        CONSTRAINT CK_Factura_total_suma CHECK (mon_total = mon_subtotal + mon_total_impuestos)
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   fact.FacturaDetalle  (resuelve la relación N:M Factura - Producto)
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'fact.FacturaDetalle', N'U') IS NULL
+BEGIN
+    CREATE TABLE fact.FacturaDetalle
+    (
+        num_factura  INT           NOT NULL
+            CONSTRAINT FK_FacturaDetalle_Factura
+            FOREIGN KEY REFERENCES fact.Factura (num_factura),
+        num_linea    INT           NOT NULL
+            CONSTRAINT CK_FacturaDetalle_linea CHECK (num_linea > 0),
+        cod_producto INT           NOT NULL
+            CONSTRAINT FK_FacturaDetalle_Producto
+            FOREIGN KEY REFERENCES fact.Producto (cod_producto),
+        num_cantidad DECIMAL(12,2) NOT NULL
+            CONSTRAINT CK_FacturaDetalle_cantidad CHECK (num_cantidad > 0),
+        mon_linea    DECIMAL(18,2) NOT NULL
+            CONSTRAINT CK_FacturaDetalle_monto CHECK (mon_linea >= 0),
+        CONSTRAINT PK_FacturaDetalle PRIMARY KEY (num_factura, num_linea)
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   fact.NotaCreditoDebito
+   ind_tipo: C crédito, D débito
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'fact.NotaCreditoDebito', N'U') IS NULL
+BEGIN
+    CREATE TABLE fact.NotaCreditoDebito
+    (
+        cod_nota    INT          NOT NULL IDENTITY(1,1)
+            CONSTRAINT PK_NotaCreditoDebito PRIMARY KEY,
+        fec_nota    DATETIME     NOT NULL
+            CONSTRAINT DF_NotaCreditoDebito_fecha DEFAULT (GETDATE()),
+        num_factura INT          NOT NULL
+            CONSTRAINT FK_NotaCreditoDebito_Factura
+            FOREIGN KEY REFERENCES fact.Factura (num_factura),
+        ind_tipo    CHAR(1)      NOT NULL
+            CONSTRAINT CK_NotaCreditoDebito_tipo CHECK (ind_tipo IN ('C','D')),
+        des_motivo  VARCHAR(300) NOT NULL
+            CONSTRAINT CK_NotaCreditoDebito_motivo CHECK (LEN(LTRIM(RTRIM(des_motivo))) > 0)
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   seg.BitacoraAcceso  (REQ 003)
+   Sin FK a otras tablas: el registro debe sobrevivir a cualquier cambio.
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'seg.BitacoraAcceso', N'U') IS NULL
+BEGIN
+    CREATE TABLE seg.BitacoraAcceso
+    (
+        cod_acceso   INT          NOT NULL IDENTITY(1,1)
+            CONSTRAINT PK_BitacoraAcceso PRIMARY KEY,
+        nom_usuario  VARCHAR(128) NOT NULL,
+        nom_terminal VARCHAR(128) NOT NULL,
+        dir_ip       VARCHAR(45)  NOT NULL,
+        fec_ingreso  DATETIME     NOT NULL
+            CONSTRAINT DF_BitacoraAcceso_ingreso DEFAULT (GETDATE()),
+        fec_salida   DATETIME     NULL,
+        fec_registro DATETIME     NOT NULL
+            CONSTRAINT DF_BitacoraAcceso_registro DEFAULT (GETDATE()),
+        CONSTRAINT CK_BitacoraAcceso_salida CHECK (fec_salida IS NULL OR fec_salida >= fec_ingreso)
+    );
+END
+GO
+
+/* ---------------------------------------------------------------------
+   aud.BitacoraAuditoria  (REQ 005)
+   - PK NONCLUSTERED sobre el GUID (aleatorio, mala llave de ordenamiento).
+   - Índice CLUSTERED por fec_registro: el reporte filtra por rango de fechas.
+   - Sin FK: la pista se conserva aunque se borre el dato original.
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'aud.BitacoraAuditoria', N'U') IS NULL
+BEGIN
+    CREATE TABLE aud.BitacoraAuditoria
+    (
+        fec_registro       DATETIME         NOT NULL
+            CONSTRAINT DF_BitacoraAuditoria_registro DEFAULT (GETDATE()),
+        cod_guid           UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_BitacoraAuditoria_guid DEFAULT (NEWID()),
+        ind_accion         CHAR(1)          NOT NULL
+            CONSTRAINT CK_BitacoraAuditoria_accion CHECK (ind_accion IN ('I','D','U')),
+        cod_usuario        VARCHAR(128)     NOT NULL,
+        cod_sesion_usuario VARCHAR(64)      NULL,
+        cod_tabla          VARCHAR(255)     NOT NULL,
+        cod_llave          VARCHAR(2000)    NULL,
+        des_datos          VARCHAR(MAX)     NULL,
+        CONSTRAINT PK_BitacoraAuditoria PRIMARY KEY NONCLUSTERED (cod_guid),
+        INDEX CIX_BitacoraAuditoria_fec_registro CLUSTERED (fec_registro)
+    );
+END
+GO
+
+PRINT '01_esquemas_y_tablas.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 02_catalogos_y_diccionario.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 02_catalogos_y_diccionario.sql
+   Propósito: 1) Carga los catálogos base (tipos de identificación e impuestos).
+              2) Registra descripciones (extended properties) de tablas y
+                 columnas para generar el diccionario de datos (REQ 010)
+                 con tools/diccionario_datos.sql.
+   Idempotente: puede ejecutarse varias veces.
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+/* ---------------------------------------------------------------------
+   1) Catálogos
+   --------------------------------------------------------------------- */
+INSERT INTO fact.TipoIdentificacion (cod_tipo_identificacion, des_tipo_identificacion)
+SELECT v.cod, v.des
+FROM (VALUES (1, 'Cédula física'),
+             (2, 'Cédula jurídica'),
+             (3, 'DIMEX'),
+             (4, 'NITE')) AS v(cod, des)
+WHERE NOT EXISTS (SELECT 1 FROM fact.TipoIdentificacion t WHERE t.cod_tipo_identificacion = v.cod);
+GO
+
+-- Tarifas de IVA de ejemplo (ajustar si el docente pide otras)
+INSERT INTO fact.TipoImpuesto (cod_impuesto, des_impuesto, por_impuesto, mon_tarifa)
+SELECT v.cod, v.des, v.por, 0
+FROM (VALUES ('IVA13', 'IVA tarifa general 13%',   13.00),
+             ('IVA4',  'IVA tarifa reducida 4%',    4.00),
+             ('IVA2',  'IVA tarifa reducida 2%',    2.00),
+             ('IVA1',  'IVA tarifa reducida 1%',    1.00),
+             ('EXE',   'Exento / tarifa 0%',        0.00)) AS v(cod, des, por)
+WHERE NOT EXISTS (SELECT 1 FROM fact.TipoImpuesto t WHERE t.cod_impuesto = v.cod);
+GO
+
+/* ---------------------------------------------------------------------
+   2) Descripciones para el diccionario de datos (REQ 010)
+   --------------------------------------------------------------------- */
+IF OBJECT_ID(N'tempdb..#desc') IS NOT NULL DROP TABLE #desc;
+CREATE TABLE #desc
+(
+    esq   SYSNAME,
+    tabla SYSNAME,
+    col   SYSNAME       NULL,
+    prop  SYSNAME,
+    val   NVARCHAR(500)
+);
+
+INSERT INTO #desc (esq, tabla, col, prop, val) VALUES
+-- ---- Tablas: nombre lógico y propósito
+(N'fact', N'TipoIdentificacion', NULL, N'NombreLogico',   N'Tipos de identificación'),
+(N'fact', N'TipoIdentificacion', NULL, N'MS_Description', N'Catálogo de documentos de identidad aceptados para los clientes.'),
+(N'fact', N'Cliente',            NULL, N'NombreLogico',   N'Clientes'),
+(N'fact', N'Cliente',            NULL, N'MS_Description', N'Registro de clientes a facturar. Identificación, correo y teléfono se almacenan cifrados (cell-level encryption).'),
+(N'fact', N'TipoImpuesto',       NULL, N'NombreLogico',   N'Tipos de impuesto'),
+(N'fact', N'TipoImpuesto',       NULL, N'MS_Description', N'Impuestos aplicables a los productos y servicios.'),
+(N'fact', N'Producto',           NULL, N'NombreLogico',   N'Productos y servicios'),
+(N'fact', N'Producto',           NULL, N'MS_Description', N'Catálogo de productos/servicios con código CABYS, precio e impuesto.'),
+(N'fact', N'Factura',            NULL, N'NombreLogico',   N'Facturas'),
+(N'fact', N'Factura',            NULL, N'MS_Description', N'Encabezado de la factura de venta de bienes raíces.'),
+(N'fact', N'FacturaDetalle',     NULL, N'NombreLogico',   N'Detalle de factura'),
+(N'fact', N'FacturaDetalle',     NULL, N'MS_Description', N'Líneas de producto/servicio de cada factura.'),
+(N'fact', N'NotaCreditoDebito',  NULL, N'NombreLogico',   N'Notas de crédito y débito'),
+(N'fact', N'NotaCreditoDebito',  NULL, N'MS_Description', N'Ajustes (crédito o débito) aplicados sobre facturas emitidas.'),
+(N'seg',  N'BitacoraAcceso',     NULL, N'NombreLogico',   N'Bitácora de acceso'),
+(N'seg',  N'BitacoraAcceso',     NULL, N'MS_Description', N'Control de ingresos y salidas de los usuarios a la aplicación (REQ 003).'),
+(N'aud',  N'BitacoraAuditoria',  NULL, N'NombreLogico',   N'Bitácora de auditoría'),
+(N'aud',  N'BitacoraAuditoria',  NULL, N'MS_Description', N'Pistas de auditoría: cada insert, update y delete queda registrado por triggers (REQ 005).'),
+
+-- ---- fact.TipoIdentificacion
+(N'fact', N'TipoIdentificacion', N'cod_tipo_identificacion', N'MS_Description', N'Identificador del tipo de identificación (1 Física, 2 Jurídica, 3 DIMEX, 4 NITE).'),
+(N'fact', N'TipoIdentificacion', N'des_tipo_identificacion', N'MS_Description', N'Descripción del tipo de identificación.'),
+(N'fact', N'TipoIdentificacion', N'ind_estado',              N'MS_Description', N'Estado del registro. Catálogo: A Activo, I Inactivo.'),
+
+-- ---- fact.Cliente
+(N'fact', N'Cliente', N'cod_cliente',             N'MS_Description', N'Identificador único del cliente (autoincremental).'),
+(N'fact', N'Cliente', N'nom_cliente',             N'MS_Description', N'Nombre completo o razón social.'),
+(N'fact', N'Cliente', N'cod_tipo_identificacion', N'MS_Description', N'Tipo de identificación del cliente.'),
+(N'fact', N'Cliente', N'num_identificacion_cif',  N'MS_Description', N'Número de identificación CIFRADO (dato sensible, AES-256).'),
+(N'fact', N'Cliente', N'hash_identificacion',     N'MS_Description', N'Hash SHA-256 de la identificación; garantiza unicidad y permite búsquedas sin descifrar.'),
+(N'fact', N'Cliente', N'nom_provincia',           N'MS_Description', N'Provincia del domicilio.'),
+(N'fact', N'Cliente', N'nom_canton',              N'MS_Description', N'Cantón del domicilio.'),
+(N'fact', N'Cliente', N'nom_distrito',            N'MS_Description', N'Distrito del domicilio.'),
+(N'fact', N'Cliente', N'nom_barrio',              N'MS_Description', N'Barrio del domicilio (opcional).'),
+(N'fact', N'Cliente', N'des_profesion',           N'MS_Description', N'Profesión u oficio (opcional).'),
+(N'fact', N'Cliente', N'des_actividad_economica', N'MS_Description', N'Actividad económica del cliente (opcional).'),
+(N'fact', N'Cliente', N'des_correo_cif',          N'MS_Description', N'Correo electrónico CIFRADO (dato sensible).'),
+(N'fact', N'Cliente', N'num_telefono_cif',        N'MS_Description', N'Teléfono CIFRADO (dato sensible, opcional).'),
+(N'fact', N'Cliente', N'fec_registro',            N'MS_Description', N'Fecha y hora de registro del cliente.'),
+(N'fact', N'Cliente', N'ind_estado',              N'MS_Description', N'Estado del cliente. Catálogo: A Activo, I Inactivo.'),
+
+-- ---- fact.TipoImpuesto
+(N'fact', N'TipoImpuesto', N'cod_tipo_impuesto', N'MS_Description', N'Identificador único del tipo de impuesto.'),
+(N'fact', N'TipoImpuesto', N'cod_impuesto',      N'MS_Description', N'Código corto del impuesto (único).'),
+(N'fact', N'TipoImpuesto', N'des_impuesto',      N'MS_Description', N'Descripción del impuesto.'),
+(N'fact', N'TipoImpuesto', N'por_impuesto',      N'MS_Description', N'Porcentaje del impuesto (0 a 100).'),
+(N'fact', N'TipoImpuesto', N'mon_tarifa',        N'MS_Description', N'Tarifa fija asociada (mayor o igual a 0).'),
+(N'fact', N'TipoImpuesto', N'ind_estado',        N'MS_Description', N'Estado. Catálogo: A Activo, I Inactivo.'),
+
+-- ---- fact.Producto
+(N'fact', N'Producto', N'cod_producto',      N'MS_Description', N'Identificador único del producto/servicio.'),
+(N'fact', N'Producto', N'cod_cabys',         N'MS_Description', N'Código CABYS de 13 dígitos (único).'),
+(N'fact', N'Producto', N'des_producto',      N'MS_Description', N'Descripción del producto o servicio.'),
+(N'fact', N'Producto', N'des_unidad_medida', N'MS_Description', N'Unidad de medida (por ejemplo Unid, Sp, m2).'),
+(N'fact', N'Producto', N'mon_precio',        N'MS_Description', N'Precio unitario (mayor o igual a 0).'),
+(N'fact', N'Producto', N'cod_tipo_impuesto', N'MS_Description', N'Impuesto que se aplica al producto.'),
+(N'fact', N'Producto', N'ind_estado',        N'MS_Description', N'Estado. Catálogo: A Activo, I Inactivo.'),
+
+-- ---- fact.Factura
+(N'fact', N'Factura', N'num_factura',         N'MS_Description', N'Número consecutivo de la factura.'),
+(N'fact', N'Factura', N'cod_cliente',         N'MS_Description', N'Cliente al que se factura.'),
+(N'fact', N'Factura', N'fec_factura',         N'MS_Description', N'Fecha y hora de emisión.'),
+(N'fact', N'Factura', N'ind_condicion_venta', N'MS_Description', N'Condición de venta. Catálogo: C Contado, R Crédito.'),
+(N'fact', N'Factura', N'ind_medio_pago',      N'MS_Description', N'Medio de pago. Catálogo: E Efectivo, T Tarjeta, Q Cheque, F Transferencia, S SINPE Móvil, O Otros.'),
+(N'fact', N'Factura', N'cod_moneda',          N'MS_Description', N'Moneda. Catálogo: CRC Colón, USD Dólar.'),
+(N'fact', N'Factura', N'mon_tipo_cambio',     N'MS_Description', N'Tipo de cambio aplicado (mayor a 0).'),
+(N'fact', N'Factura', N'des_observaciones',   N'MS_Description', N'Observaciones de la factura (opcional).'),
+(N'fact', N'Factura', N'mon_subtotal',        N'MS_Description', N'Subtotal antes de impuestos.'),
+(N'fact', N'Factura', N'mon_total_impuestos', N'MS_Description', N'Suma de impuestos de la factura.'),
+(N'fact', N'Factura', N'mon_total',           N'MS_Description', N'Monto total = subtotal + impuestos (validado por CHECK).'),
+
+-- ---- fact.FacturaDetalle
+(N'fact', N'FacturaDetalle', N'num_factura',  N'MS_Description', N'Factura a la que pertenece la línea.'),
+(N'fact', N'FacturaDetalle', N'num_linea',    N'MS_Description', N'Número de línea dentro de la factura.'),
+(N'fact', N'FacturaDetalle', N'cod_producto', N'MS_Description', N'Producto o servicio facturado.'),
+(N'fact', N'FacturaDetalle', N'num_cantidad', N'MS_Description', N'Cantidad facturada (mayor a 0).'),
+(N'fact', N'FacturaDetalle', N'mon_linea',     N'MS_Description', N'Monto de la línea (cantidad por precio).'),
+
+-- ---- fact.NotaCreditoDebito
+(N'fact', N'NotaCreditoDebito', N'cod_nota',    N'MS_Description', N'Código único de la nota.'),
+(N'fact', N'NotaCreditoDebito', N'fec_nota',    N'MS_Description', N'Fecha y hora de la nota.'),
+(N'fact', N'NotaCreditoDebito', N'num_factura', N'MS_Description', N'Factura afectada.'),
+(N'fact', N'NotaCreditoDebito', N'ind_tipo',    N'MS_Description', N'Tipo de nota. Catálogo: C Crédito, D Débito.'),
+(N'fact', N'NotaCreditoDebito', N'des_motivo',  N'MS_Description', N'Motivo del ajuste.'),
+
+-- ---- seg.BitacoraAcceso
+(N'seg', N'BitacoraAcceso', N'cod_acceso',   N'MS_Description', N'Identificador del registro de acceso.'),
+(N'seg', N'BitacoraAcceso', N'nom_usuario',  N'MS_Description', N'Usuario (login) que ingresó.'),
+(N'seg', N'BitacoraAcceso', N'nom_terminal', N'MS_Description', N'Nombre del equipo desde el que ingresó.'),
+(N'seg', N'BitacoraAcceso', N'dir_ip',       N'MS_Description', N'Dirección IP del cliente (IPv4 o IPv6).'),
+(N'seg', N'BitacoraAcceso', N'fec_ingreso',  N'MS_Description', N'Fecha y hora de ingreso.'),
+(N'seg', N'BitacoraAcceso', N'fec_salida',   N'MS_Description', N'Fecha y hora de salida (NULL si la sesión sigue abierta).'),
+(N'seg', N'BitacoraAcceso', N'fec_registro', N'MS_Description', N'Fecha y hora en que se grabó el registro.'),
+
+-- ---- aud.BitacoraAuditoria
+(N'aud', N'BitacoraAuditoria', N'fec_registro',       N'MS_Description', N'Fecha y hora del registro en bitácora.'),
+(N'aud', N'BitacoraAuditoria', N'cod_guid',           N'MS_Description', N'Identificador único del registro (NEWID()).'),
+(N'aud', N'BitacoraAuditoria', N'ind_accion',         N'MS_Description', N'Acción. Catálogo: I Inserción, D Borrado, U Modificación.'),
+(N'aud', N'BitacoraAuditoria', N'cod_usuario',        N'MS_Description', N'Usuario que ejecutó la acción.'),
+(N'aud', N'BitacoraAuditoria', N'cod_sesion_usuario', N'MS_Description', N'Sesión de base de datos del usuario (SESSION_CONTEXT).'),
+(N'aud', N'BitacoraAuditoria', N'cod_tabla',          N'MS_Description', N'Tabla afectada.'),
+(N'aud', N'BitacoraAuditoria', N'cod_llave',          N'MS_Description', N'Llave primaria del registro afectado (trazabilidad).'),
+(N'aud', N'BitacoraAuditoria', N'des_datos',          N'MS_Description', N'Datos de la acción en JSON; en update incluye ANTES y DESPUÉS.');
+
+DECLARE @esq SYSNAME, @tabla SYSNAME, @col SYSNAME, @prop SYSNAME, @val NVARCHAR(500);
+DECLARE @minor INT, @existe BIT, @l2type NVARCHAR(128);
+
+DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT esq, tabla, col, prop, val FROM #desc;
+
+OPEN cur;
+FETCH NEXT FROM cur INTO @esq, @tabla, @col, @prop, @val;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @minor  = CASE WHEN @col IS NULL THEN 0
+                       ELSE COLUMNPROPERTY(OBJECT_ID(@esq + N'.' + @tabla), @col, 'ColumnId') END;
+    SET @l2type = CASE WHEN @col IS NULL THEN NULL ELSE N'COLUMN' END;
+
+    SET @existe = CASE WHEN EXISTS (SELECT 1
+                                    FROM sys.extended_properties
+                                    WHERE class = 1
+                                      AND major_id = OBJECT_ID(@esq + N'.' + @tabla)
+                                      AND minor_id = @minor
+                                      AND name = @prop)
+                       THEN 1 ELSE 0 END;
+
+    IF @existe = 1
+        EXEC sys.sp_updateextendedproperty
+             @name = @prop, @value = @val,
+             @level0type = N'SCHEMA', @level0name = @esq,
+             @level1type = N'TABLE',  @level1name = @tabla,
+             @level2type = @l2type,   @level2name = @col;
+    ELSE
+        EXEC sys.sp_addextendedproperty
+             @name = @prop, @value = @val,
+             @level0type = N'SCHEMA', @level0name = @esq,
+             @level1type = N'TABLE',  @level1name = @tabla,
+             @level2type = @l2type,   @level2name = @col;
+
+    FETCH NEXT FROM cur INTO @esq, @tabla, @col, @prop, @val;
+END
+
+CLOSE cur;
+DEALLOCATE cur;
+DROP TABLE #desc;
+GO
+
+PRINT '02_catalogos_y_diccionario.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 03_seguridad_cifrado.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 03_seguridad_cifrado.sql
+   Propósito: Infraestructura de Cell-Level Encryption (REQ 006):
+              Database Master Key -> Certificado -> Clave simétrica AES-256.
+   Idempotente.
+
+   IMPORTANTE (trabajo en equipo con BD local)
+     - La master key y el certificado se generan EN CADA MÁQUINA, por lo
+       que los datos cifrados de un equipo NO se pueden descifrar en el otro.
+       Los datos de prueba deben insertarse con los procedimientos/scripts
+       (que cifran con la clave local), nunca restaurando backups ajenos.
+     - La contraseña de abajo es SOLO de desarrollo. En producción debe
+       vivir en un gestor de secretos (documentar en REQ 012).
+     - Respaldar el certificado es obligatorio para poder restaurar la BD
+       en otro servidor (documentar en REQ 013). Ver bloque comentado al final.
+
+   Uso desde los procedimientos almacenados:
+       OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+       ... ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), @valor)) ...
+       ... CONVERT(VARCHAR(150), DECRYPTBYKEY(columna_cif)) ...
+       CLOSE SYMMETRIC KEY sk_Propi_Datos;
+   Mantener los valores a cifrar en VARCHAR(<=150) para que quepan en
+   VARBINARY(256); el correo (VARBINARY(512)) admite hasta ~250 caracteres.
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+-- 1) Database Master Key
+IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = N'##MS_DatabaseMasterKey##')
+BEGIN
+    CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'Dev_Propi#2026_CambiarEnProduccion!';
+    PRINT 'Master key creada.';
+END
+GO
+
+-- 2) Certificado que protege la clave simétrica
+IF NOT EXISTS (SELECT 1 FROM sys.certificates WHERE name = N'cert_Propi_Datos')
+BEGIN
+    CREATE CERTIFICATE cert_Propi_Datos
+        WITH SUBJECT     = N'Propi - cifrado columnar de datos sensibles',
+             EXPIRY_DATE = '20361231';
+    PRINT 'Certificado creado.';
+END
+GO
+
+-- 3) Clave simétrica AES-256
+IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = N'sk_Propi_Datos')
+BEGIN
+    CREATE SYMMETRIC KEY sk_Propi_Datos
+        WITH ALGORITHM = AES_256
+        ENCRYPTION BY CERTIFICATE cert_Propi_Datos;
+    PRINT 'Clave simétrica creada.';
+END
+GO
+
+-- 4) Prueba rápida de cifrado / descifrado (debe mostrar el texto original)
+OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+
+DECLARE @cifrado VARBINARY(256) =
+        ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), '1-0234-0567'));
+
+SELECT  @cifrado                                          AS valor_cifrado,
+        CONVERT(VARCHAR(150), DECRYPTBYKEY(@cifrado))     AS valor_descifrado;
+
+CLOSE SYMMETRIC KEY sk_Propi_Datos;
+GO
+
+/* ---------------------------------------------------------------------
+   Respaldo del certificado (ejecutar manualmente, NO subir los archivos a Git)
+   ---------------------------------------------------------------------
+   BACKUP CERTIFICATE cert_Propi_Datos
+       TO FILE = 'C:\respaldos_seguros\cert_Propi_Datos.cer'
+       WITH PRIVATE KEY (
+           FILE = 'C:\respaldos_seguros\cert_Propi_Datos.pvk',
+           ENCRYPTION BY PASSWORD = 'OtraClaveFuerte#2026');
+   --------------------------------------------------------------------- */
+
+PRINT '03_seguridad_cifrado.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 04_triggers_auditoria.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 04_triggers_auditoria.sql
+   Propósito: Pistas de auditoría (REQ 005). Genera 3 triggers (I, U, D)
+              por cada tabla de negocio y de acceso, a partir de UNA plantilla.
+   Idempotente: usa CREATE OR ALTER.
+
+   Tablas auditadas : todas las de los esquemas fact y seg (8 tablas = 24 triggers).
+   Tabla de bitácora: aud.BitacoraAuditoria no se audita a sí misma (recursión);
+                      en su lugar se protege como "solo inserción" con un
+                      trigger INSTEAD OF UPDATE/DELETE (al final del script).
+
+   Qué registra cada fila de bitácora
+     ind_accion         I / U / D
+     cod_usuario        ORIGINAL_LOGIN()  (el login real, aunque haya EXECUTE AS)
+     cod_sesion_usuario SESSION_CONTEXT('cod_sesion'), que fija app.usp_Acceso_Registrar
+     cod_tabla          esquema.tabla
+     cod_llave          PK, p. ej.  cod_cliente=15   o   num_factura=3|num_linea=2
+     des_datos          JSON. Insert/Delete: el registro. Update: {"ANTES":{..},"DESPUES":{..}}
+
+   Seguridad: las columnas cifradas (*_cif) y hash_identificacion NO se
+   vuelcan a la bitácora, para no filtrar datos sensibles (REQ 006).
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+DECLARE @esq SYSNAME, @tab SYSNAME, @obj INT;
+DECLARE @keyExpr NVARCHAR(MAX), @colsExpr NVARCHAR(MAX), @joinExpr NVARCHAR(MAX);
+DECLARE @full NVARCHAR(300), @tblName NVARCHAR(300), @sql NVARCHAR(MAX);
+DECLARE @tI NVARCHAR(MAX), @tU NVARCHAR(MAX), @tD NVARCHAR(MAX);
+
+/* ---- Plantillas (tokens ~X~ se reemplazan por tabla) ---- */
+SET @tI = N'CREATE OR ALTER TRIGGER ~TRG~ ON ~TBL~ AFTER INSERT AS
+BEGIN
+    SET NOCOUNT ON;
+    INSERT INTO aud.BitacoraAuditoria (ind_accion, cod_usuario, cod_sesion_usuario, cod_tabla, cod_llave, des_datos)
+    SELECT ''I'', ORIGINAL_LOGIN(), CONVERT(VARCHAR(64), SESSION_CONTEXT(N''cod_sesion'')), ''~TBLNAME~'',
+           ~KEY_I~,
+           (SELECT ~COLS_I~ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES)
+    FROM inserted AS i;
+END';
+
+SET @tD = N'CREATE OR ALTER TRIGGER ~TRG~ ON ~TBL~ AFTER DELETE AS
+BEGIN
+    SET NOCOUNT ON;
+    INSERT INTO aud.BitacoraAuditoria (ind_accion, cod_usuario, cod_sesion_usuario, cod_tabla, cod_llave, des_datos)
+    SELECT ''D'', ORIGINAL_LOGIN(), CONVERT(VARCHAR(64), SESSION_CONTEXT(N''cod_sesion'')), ''~TBLNAME~'',
+           ~KEY_D~,
+           (SELECT ~COLS_D~ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES)
+    FROM deleted AS d;
+END';
+
+SET @tU = N'CREATE OR ALTER TRIGGER ~TRG~ ON ~TBL~ AFTER UPDATE AS
+BEGIN
+    SET NOCOUNT ON;
+    INSERT INTO aud.BitacoraAuditoria (ind_accion, cod_usuario, cod_sesion_usuario, cod_tabla, cod_llave, des_datos)
+    SELECT ''U'', ORIGINAL_LOGIN(), CONVERT(VARCHAR(64), SESSION_CONTEXT(N''cod_sesion'')), ''~TBLNAME~'',
+           ~KEY_I~,
+           (SELECT JSON_QUERY((SELECT ~COLS_D~ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES)) AS ANTES,
+                   JSON_QUERY((SELECT ~COLS_I~ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES)) AS DESPUES
+            FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)
+    FROM inserted AS i
+    JOIN deleted  AS d ON ~JOIN~;
+END';
+
+DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT s.name, t.name, t.object_id
+    FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE s.name IN (N'fact', N'seg')
+    ORDER BY s.name, t.name;
+
+OPEN cur;
+FETCH NEXT FROM cur INTO @esq, @tab, @obj;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @full    = QUOTENAME(@esq) + N'.' + QUOTENAME(@tab);
+    SET @tblName = @esq + N'.' + @tab;
+
+    -- Expresión de la llave primaria: N'col=' + CONVERT(...) + N'|' + ...
+    SELECT @keyExpr = STRING_AGG(
+               CONVERT(NVARCHAR(MAX), N'N''' + c.name + N'='' + CONVERT(NVARCHAR(100), ~A~.' + QUOTENAME(c.name) + N')'),
+               N' + N''|'' + ') WITHIN GROUP (ORDER BY ic.key_ordinal)
+    FROM sys.indexes i
+    JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+    JOIN sys.columns c        ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+    WHERE i.object_id = @obj AND i.is_primary_key = 1;
+
+    -- Condición de join por PK (para el trigger de update)
+    SELECT @joinExpr = STRING_AGG(
+               CONVERT(NVARCHAR(MAX), N'i.' + QUOTENAME(c.name) + N' = d.' + QUOTENAME(c.name)), N' AND ')
+    FROM sys.indexes i
+    JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+    JOIN sys.columns c        ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+    WHERE i.object_id = @obj AND i.is_primary_key = 1;
+
+    -- Columnas a auditar (se excluyen las cifradas y el hash de identificación)
+    SELECT @colsExpr = STRING_AGG(CONVERT(NVARCHAR(MAX), N'~A~.' + QUOTENAME(c.name)), N', ')
+                       WITHIN GROUP (ORDER BY c.column_id)
+    FROM sys.columns c
+    WHERE c.object_id = @obj
+      AND c.name NOT LIKE N'%[_]cif'
+      AND c.name <> N'hash_identificacion';
+
+    -- INSERT
+    SET @sql = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@tI,
+               N'~TRG~',     QUOTENAME(@esq) + N'.' + QUOTENAME(N'trg_' + @tab + N'_aud_I')),
+               N'~TBL~',     @full),
+               N'~TBLNAME~', @tblName),
+               N'~KEY_I~',   REPLACE(@keyExpr,  N'~A~', N'i')),
+               N'~COLS_I~',  REPLACE(@colsExpr, N'~A~', N'i'));
+    EXEC sys.sp_executesql @sql;
+
+    -- DELETE
+    SET @sql = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@tD,
+               N'~TRG~',     QUOTENAME(@esq) + N'.' + QUOTENAME(N'trg_' + @tab + N'_aud_D')),
+               N'~TBL~',     @full),
+               N'~TBLNAME~', @tblName),
+               N'~KEY_D~',   REPLACE(@keyExpr,  N'~A~', N'd')),
+               N'~COLS_D~',  REPLACE(@colsExpr, N'~A~', N'd'));
+    EXEC sys.sp_executesql @sql;
+
+    -- UPDATE
+    SET @sql = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@tU,
+               N'~TRG~',     QUOTENAME(@esq) + N'.' + QUOTENAME(N'trg_' + @tab + N'_aud_U')),
+               N'~TBL~',     @full),
+               N'~TBLNAME~', @tblName),
+               N'~KEY_I~',   REPLACE(@keyExpr,  N'~A~', N'i')),
+               N'~COLS_I~',  REPLACE(@colsExpr, N'~A~', N'i')),
+               N'~COLS_D~',  REPLACE(@colsExpr, N'~A~', N'd')),
+               N'~JOIN~',    @joinExpr);
+    EXEC sys.sp_executesql @sql;
+
+    PRINT N'Triggers de auditoría (I/U/D) listos para ' + @tblName;
+    FETCH NEXT FROM cur INTO @esq, @tab, @obj;
+END
+CLOSE cur;
+DEALLOCATE cur;
+GO
+
+/* ---------------------------------------------------------------------
+   La bitácora de auditoría es de SOLO INSERCIÓN (nadie, ni el admin,
+   puede alterar o borrar pistas). Los triggers de arriba la alimentan.
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER aud.trg_BitacoraAuditoria_inmutable
+ON aud.BitacoraAuditoria
+INSTEAD OF UPDATE, DELETE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    THROW 51000, N'La bitácora de auditoría es de solo inserción: no se permite modificar ni borrar.', 1;
+END
+GO
+
+PRINT '04_triggers_auditoria.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 05_procedimientos_crud.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 05_procedimientos_crud.sql
+   Propósito: Toda la lógica de acceso a datos de la aplicación (REQ 002),
+              login/logout (REQ 003) y cifrado columnar (REQ 006).
+              La app SOLO ejecuta estos procedimientos (sin SQL dinámico ni
+              concatenado -> sin SQL Injection).
+   Idempotente: CREATE OR ALTER.
+
+   Convenciones
+     - Esquema app (dueño dbo). Los usuarios solo reciben EXECUTE (ver 07).
+     - WITH EXECUTE AS OWNER: permite abrir la clave simétrica sin darle
+       permisos sobre el certificado a los usuarios. ORIGINAL_LOGIN() sigue
+       devolviendo el login real, así que la auditoría no se contamina.
+     - Todos usan TRY...CATCH; los que modifican datos usan transacción.
+     - Errores de negocio: THROW 50001+ con mensaje legible para el frontend.
+   Códigos de error propios
+     50001 identificación vacía        50002 identificación duplicada
+     50003 registro con dependencias   50004 registro no encontrado
+     50010 factura sin líneas          50011 cliente inexistente/inactivo
+     50012 producto inexistente/inactivo
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+IF SCHEMA_ID(N'app') IS NULL EXEC (N'CREATE SCHEMA app AUTHORIZATION dbo;');
+GO
+
+-- Tipo de tabla para enviar el detalle de una factura en una sola llamada
+IF TYPE_ID(N'app.TD_FacturaDetalle') IS NULL
+    CREATE TYPE app.TD_FacturaDetalle AS TABLE
+    (
+        cod_producto INT           NOT NULL,
+        num_cantidad DECIMAL(12,2) NOT NULL CHECK (num_cantidad > 0)
+    );
+GO
+
+/* =====================================================================
+   ACCESO (REQ 003)
+   La app abre la conexión con el login/clave del usuario y llama a
+   usp_Acceso_Registrar. Eso inserta en seg.BitacoraAcceso y deja el
+   id de acceso en SESSION_CONTEXT('cod_sesion'), que leen los triggers.
+   OJO con el pool de conexiones: sp_reset_connection borra el
+   SESSION_CONTEXT; la app debe mantener su conexión abierta o volver a
+   llamar a este procedimiento al reutilizarla.
+   ===================================================================== */
+CREATE OR ALTER PROCEDURE app.usp_Acceso_Registrar
+    @nom_terminal VARCHAR(128) = NULL,   -- la app puede enviar Environment.MachineName
+    @dir_ip       VARCHAR(45)  = NULL,   -- ... y su IP; si no, se toma del servidor
+    @cod_acceso   INT          = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        DECLARE @sesion NVARCHAR(64);
+
+        INSERT INTO seg.BitacoraAcceso (nom_usuario, nom_terminal, dir_ip)
+        VALUES (ORIGINAL_LOGIN(),
+                ISNULL(@nom_terminal, HOST_NAME()),
+                ISNULL(@dir_ip, ISNULL(CONVERT(VARCHAR(45), CONNECTIONPROPERTY('client_net_address')), '(local)')));
+
+        SET @cod_acceso = SCOPE_IDENTITY();
+        SET @sesion     = CONVERT(NVARCHAR(64), @cod_acceso);
+        EXEC sys.sp_set_session_context @key = N'cod_sesion', @value = @sesion;
+
+        SELECT @cod_acceso AS cod_acceso;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Acceso_Cerrar
+    @cod_acceso INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        UPDATE seg.BitacoraAcceso
+           SET fec_salida = GETDATE()
+         WHERE cod_acceso  = @cod_acceso
+           AND nom_usuario = ORIGINAL_LOGIN()   -- cada quien cierra solo su sesión
+           AND fec_salida IS NULL;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+/* =====================================================================
+   CATÁLOGO: TIPO DE IDENTIFICACIÓN
+   ===================================================================== */
+CREATE OR ALTER PROCEDURE app.usp_TipoIdentificacion_Listar
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        SELECT cod_tipo_identificacion, des_tipo_identificacion, ind_estado
+        FROM fact.TipoIdentificacion
+        WHERE ind_estado = 'A'
+        ORDER BY cod_tipo_identificacion;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+/* =====================================================================
+   TIPO DE IMPUESTO
+   ===================================================================== */
+CREATE OR ALTER PROCEDURE app.usp_TipoImpuesto_Insertar
+    @cod_impuesto VARCHAR(10),
+    @des_impuesto VARCHAR(100),
+    @por_impuesto DECIMAL(5,2),
+    @mon_tarifa   DECIMAL(18,2) = 0,
+    @cod_tipo_impuesto INT = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        INSERT INTO fact.TipoImpuesto (cod_impuesto, des_impuesto, por_impuesto, mon_tarifa)
+        VALUES (@cod_impuesto, @des_impuesto, @por_impuesto, @mon_tarifa);
+        SET @cod_tipo_impuesto = SCOPE_IDENTITY();
+        COMMIT;
+        SELECT @cod_tipo_impuesto AS cod_tipo_impuesto;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_TipoImpuesto_Actualizar
+    @cod_tipo_impuesto INT,
+    @cod_impuesto VARCHAR(10),
+    @des_impuesto VARCHAR(100),
+    @por_impuesto DECIMAL(5,2),
+    @mon_tarifa   DECIMAL(18,2),
+    @ind_estado   CHAR(1)
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        UPDATE fact.TipoImpuesto
+           SET cod_impuesto = @cod_impuesto, des_impuesto = @des_impuesto,
+               por_impuesto = @por_impuesto, mon_tarifa   = @mon_tarifa,
+               ind_estado   = @ind_estado
+         WHERE cod_tipo_impuesto = @cod_tipo_impuesto;
+        IF @@ROWCOUNT = 0 THROW 50004, N'El tipo de impuesto no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_TipoImpuesto_Eliminar
+    @cod_tipo_impuesto INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        DELETE FROM fact.TipoImpuesto WHERE cod_tipo_impuesto = @cod_tipo_impuesto;
+        IF @@ROWCOUNT = 0 THROW 50004, N'El tipo de impuesto no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        DECLARE @n INT = ERROR_NUMBER();
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        IF @n = 547 THROW 50003, N'No se puede eliminar: hay productos con este impuesto. Inactívelo en su lugar.', 1;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_TipoImpuesto_Obtener
+    @cod_tipo_impuesto INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        SELECT cod_tipo_impuesto, cod_impuesto, des_impuesto, por_impuesto, mon_tarifa, ind_estado
+        FROM fact.TipoImpuesto WHERE cod_tipo_impuesto = @cod_tipo_impuesto;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_TipoImpuesto_Listar
+    @ind_estado CHAR(1) = NULL      -- NULL = todos
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        SELECT cod_tipo_impuesto, cod_impuesto, des_impuesto, por_impuesto, mon_tarifa, ind_estado
+        FROM fact.TipoImpuesto
+        WHERE @ind_estado IS NULL OR ind_estado = @ind_estado
+        ORDER BY cod_impuesto;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+/* =====================================================================
+   PRODUCTO / SERVICIO
+   ===================================================================== */
+CREATE OR ALTER PROCEDURE app.usp_Producto_Insertar
+    @cod_cabys         VARCHAR(13),
+    @des_producto      VARCHAR(200),
+    @des_unidad_medida VARCHAR(20),
+    @mon_precio        DECIMAL(18,2),
+    @cod_tipo_impuesto INT,
+    @cod_producto      INT = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        INSERT INTO fact.Producto (cod_cabys, des_producto, des_unidad_medida, mon_precio, cod_tipo_impuesto)
+        VALUES (@cod_cabys, @des_producto, @des_unidad_medida, @mon_precio, @cod_tipo_impuesto);
+        SET @cod_producto = SCOPE_IDENTITY();
+        COMMIT;
+        SELECT @cod_producto AS cod_producto;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Producto_Actualizar
+    @cod_producto      INT,
+    @cod_cabys         VARCHAR(13),
+    @des_producto      VARCHAR(200),
+    @des_unidad_medida VARCHAR(20),
+    @mon_precio        DECIMAL(18,2),
+    @cod_tipo_impuesto INT,
+    @ind_estado        CHAR(1)
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        UPDATE fact.Producto
+           SET cod_cabys = @cod_cabys, des_producto = @des_producto,
+               des_unidad_medida = @des_unidad_medida, mon_precio = @mon_precio,
+               cod_tipo_impuesto = @cod_tipo_impuesto, ind_estado = @ind_estado
+         WHERE cod_producto = @cod_producto;
+        IF @@ROWCOUNT = 0 THROW 50004, N'El producto no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Producto_Eliminar
+    @cod_producto INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        DELETE FROM fact.Producto WHERE cod_producto = @cod_producto;
+        IF @@ROWCOUNT = 0 THROW 50004, N'El producto no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        DECLARE @n INT = ERROR_NUMBER();
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        IF @n = 547 THROW 50003, N'No se puede eliminar: el producto ya fue facturado. Inactívelo en su lugar.', 1;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Producto_Obtener
+    @cod_producto INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        SELECT p.cod_producto, p.cod_cabys, p.des_producto, p.des_unidad_medida, p.mon_precio,
+               p.cod_tipo_impuesto, ti.cod_impuesto, ti.por_impuesto, p.ind_estado
+        FROM fact.Producto p
+        JOIN fact.TipoImpuesto ti ON ti.cod_tipo_impuesto = p.cod_tipo_impuesto
+        WHERE p.cod_producto = @cod_producto;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Producto_Listar
+    @ind_estado CHAR(1) = NULL      -- NULL = todos
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        SELECT p.cod_producto, p.cod_cabys, p.des_producto, p.des_unidad_medida, p.mon_precio,
+               p.cod_tipo_impuesto, ti.cod_impuesto, ti.por_impuesto, p.ind_estado
+        FROM fact.Producto p
+        JOIN fact.TipoImpuesto ti ON ti.cod_tipo_impuesto = p.cod_tipo_impuesto
+        WHERE @ind_estado IS NULL OR p.ind_estado = @ind_estado
+        ORDER BY p.des_producto;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+/* =====================================================================
+   CLIENTE  (REQ 006: identificación, correo y teléfono cifrados)
+   hash_identificacion = SHA2_256( tipo + '|' + número normalizado )
+   (normalizado = sin guiones ni espacios, en mayúscula)
+   Los datos se descifran SOLO dentro de estos procedimientos.
+   ===================================================================== */
+CREATE OR ALTER PROCEDURE app.usp_Cliente_Insertar
+    @nom_cliente             VARCHAR(150),
+    @cod_tipo_identificacion TINYINT,
+    @num_identificacion      VARCHAR(50),
+    @nom_provincia           VARCHAR(50),
+    @nom_canton              VARCHAR(50),
+    @nom_distrito            VARCHAR(50),
+    @nom_barrio              VARCHAR(80)  = NULL,
+    @des_profesion           VARCHAR(100) = NULL,
+    @des_actividad_economica VARCHAR(150) = NULL,
+    @des_correo              VARCHAR(250),
+    @num_telefono            VARCHAR(30)  = NULL,
+    @cod_cliente             INT          = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @norm VARCHAR(50) = UPPER(REPLACE(REPLACE(LTRIM(RTRIM(@num_identificacion)), '-', ''), ' ', ''));
+    DECLARE @hash VARBINARY(32);
+    BEGIN TRY
+        IF @norm = '' THROW 50001, N'El número de identificación es obligatorio.', 1;
+        SET @hash = HASHBYTES('SHA2_256', CONCAT(@cod_tipo_identificacion, '|', @norm));
+        IF EXISTS (SELECT 1 FROM fact.Cliente WHERE hash_identificacion = @hash)
+            THROW 50002, N'Ya existe un cliente con esa identificación.', 1;
+
+        OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+        BEGIN TRAN;
+        INSERT INTO fact.Cliente
+            (nom_cliente, cod_tipo_identificacion, num_identificacion_cif, hash_identificacion,
+             nom_provincia, nom_canton, nom_distrito, nom_barrio, des_profesion, des_actividad_economica,
+             des_correo_cif, num_telefono_cif)
+        VALUES
+            (@nom_cliente, @cod_tipo_identificacion,
+             ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), @num_identificacion)),
+             @hash,
+             @nom_provincia, @nom_canton, @nom_distrito, @nom_barrio, @des_profesion, @des_actividad_economica,
+             ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(250), @des_correo)),
+             CASE WHEN @num_telefono IS NULL THEN NULL
+                  ELSE ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), @num_telefono)) END);
+        SET @cod_cliente = SCOPE_IDENTITY();
+        COMMIT;
+        CLOSE SYMMETRIC KEY sk_Propi_Datos;
+
+        SELECT @cod_cliente AS cod_cliente;
+    END TRY
+    BEGIN CATCH
+        IF EXISTS (SELECT 1 FROM sys.openkeys WHERE key_name = N'sk_Propi_Datos')
+            CLOSE SYMMETRIC KEY sk_Propi_Datos;
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Cliente_Actualizar
+    @cod_cliente             INT,
+    @nom_cliente             VARCHAR(150),
+    @cod_tipo_identificacion TINYINT,
+    @num_identificacion      VARCHAR(50),
+    @nom_provincia           VARCHAR(50),
+    @nom_canton              VARCHAR(50),
+    @nom_distrito            VARCHAR(50),
+    @nom_barrio              VARCHAR(80)  = NULL,
+    @des_profesion           VARCHAR(100) = NULL,
+    @des_actividad_economica VARCHAR(150) = NULL,
+    @des_correo              VARCHAR(250),
+    @num_telefono            VARCHAR(30)  = NULL,
+    @ind_estado              CHAR(1)      = 'A'
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @norm VARCHAR(50) = UPPER(REPLACE(REPLACE(LTRIM(RTRIM(@num_identificacion)), '-', ''), ' ', ''));
+    DECLARE @hash VARBINARY(32);
+    BEGIN TRY
+        IF @norm = '' THROW 50001, N'El número de identificación es obligatorio.', 1;
+        IF NOT EXISTS (SELECT 1 FROM fact.Cliente WHERE cod_cliente = @cod_cliente)
+            THROW 50004, N'El cliente no existe.', 1;
+        SET @hash = HASHBYTES('SHA2_256', CONCAT(@cod_tipo_identificacion, '|', @norm));
+        IF EXISTS (SELECT 1 FROM fact.Cliente WHERE hash_identificacion = @hash AND cod_cliente <> @cod_cliente)
+            THROW 50002, N'Ya existe otro cliente con esa identificación.', 1;
+
+        OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+        BEGIN TRAN;
+        UPDATE fact.Cliente
+           SET nom_cliente = @nom_cliente,
+               cod_tipo_identificacion = @cod_tipo_identificacion,
+               num_identificacion_cif  = ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), @num_identificacion)),
+               hash_identificacion     = @hash,
+               nom_provincia = @nom_provincia, nom_canton = @nom_canton, nom_distrito = @nom_distrito,
+               nom_barrio = @nom_barrio, des_profesion = @des_profesion,
+               des_actividad_economica = @des_actividad_economica,
+               des_correo_cif   = ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(250), @des_correo)),
+               num_telefono_cif = CASE WHEN @num_telefono IS NULL THEN NULL
+                                       ELSE ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), @num_telefono)) END,
+               ind_estado = @ind_estado
+         WHERE cod_cliente = @cod_cliente;
+        COMMIT;
+        CLOSE SYMMETRIC KEY sk_Propi_Datos;
+    END TRY
+    BEGIN CATCH
+        IF EXISTS (SELECT 1 FROM sys.openkeys WHERE key_name = N'sk_Propi_Datos')
+            CLOSE SYMMETRIC KEY sk_Propi_Datos;
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Cliente_CambiarEstado
+    @cod_cliente INT,
+    @ind_estado  CHAR(1)
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        UPDATE fact.Cliente SET ind_estado = @ind_estado WHERE cod_cliente = @cod_cliente;
+        IF @@ROWCOUNT = 0 THROW 50004, N'El cliente no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Cliente_Eliminar
+    @cod_cliente INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        DELETE FROM fact.Cliente WHERE cod_cliente = @cod_cliente;
+        IF @@ROWCOUNT = 0 THROW 50004, N'El cliente no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        DECLARE @n INT = ERROR_NUMBER();
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        IF @n = 547 THROW 50003, N'No se puede eliminar: el cliente tiene facturas. Inactívelo en su lugar.', 1;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Cliente_Obtener
+    @cod_cliente INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+        SELECT c.cod_cliente, c.nom_cliente, c.cod_tipo_identificacion,
+               CONVERT(VARCHAR(50),  DECRYPTBYKEY(c.num_identificacion_cif)) AS num_identificacion,
+               c.nom_provincia, c.nom_canton, c.nom_distrito, c.nom_barrio,
+               c.des_profesion, c.des_actividad_economica,
+               CONVERT(VARCHAR(250), DECRYPTBYKEY(c.des_correo_cif))   AS des_correo,
+               CONVERT(VARCHAR(30),  DECRYPTBYKEY(c.num_telefono_cif)) AS num_telefono,
+               c.fec_registro, c.ind_estado
+        FROM fact.Cliente c
+        WHERE c.cod_cliente = @cod_cliente;
+        CLOSE SYMMETRIC KEY sk_Propi_Datos;
+    END TRY
+    BEGIN CATCH
+        IF EXISTS (SELECT 1 FROM sys.openkeys WHERE key_name = N'sk_Propi_Datos')
+            CLOSE SYMMETRIC KEY sk_Propi_Datos;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Cliente_Listar
+    @ind_estado CHAR(1) = NULL      -- NULL = todos
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+        SELECT c.cod_cliente, c.nom_cliente, c.cod_tipo_identificacion,
+               CONVERT(VARCHAR(50),  DECRYPTBYKEY(c.num_identificacion_cif)) AS num_identificacion,
+               c.nom_provincia, c.nom_canton, c.nom_distrito,
+               c.des_actividad_economica,
+               CONVERT(VARCHAR(250), DECRYPTBYKEY(c.des_correo_cif))   AS des_correo,
+               CONVERT(VARCHAR(30),  DECRYPTBYKEY(c.num_telefono_cif)) AS num_telefono,
+               c.fec_registro, c.ind_estado
+        FROM fact.Cliente c
+        WHERE @ind_estado IS NULL OR c.ind_estado = @ind_estado
+        ORDER BY c.nom_cliente;
+        CLOSE SYMMETRIC KEY sk_Propi_Datos;
+    END TRY
+    BEGIN CATCH
+        IF EXISTS (SELECT 1 FROM sys.openkeys WHERE key_name = N'sk_Propi_Datos')
+            CLOSE SYMMETRIC KEY sk_Propi_Datos;
+        THROW;
+    END CATCH
+END
+GO
+
+/* =====================================================================
+   FACTURA
+   El frontend envía encabezado + líneas (producto, cantidad). El servidor
+   calcula montos con el precio e impuesto vigentes:
+       mon_linea     = ROUND(cantidad * precio, 2)
+       impuesto/línea= ROUND(mon_linea * por_impuesto / 100, 2)
+   y deja el CHECK  total = subtotal + impuestos satisfecho.
+   (Se asume que los precios del catálogo están en la moneda de la factura.)
+   ===================================================================== */
+CREATE OR ALTER PROCEDURE app.usp_Factura_Insertar
+    @cod_cliente         INT,
+    @ind_condicion_venta CHAR(1),
+    @ind_medio_pago      CHAR(1),
+    @cod_moneda          CHAR(3)       = 'CRC',
+    @mon_tipo_cambio     DECIMAL(10,4) = 1,
+    @des_observaciones   VARCHAR(500)  = NULL,
+    @detalle             app.TD_FacturaDetalle READONLY,
+    @num_factura         INT           = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        IF NOT EXISTS (SELECT 1 FROM @detalle)
+            THROW 50010, N'La factura debe tener al menos una línea.', 1;
+        IF NOT EXISTS (SELECT 1 FROM fact.Cliente WHERE cod_cliente = @cod_cliente AND ind_estado = 'A')
+            THROW 50011, N'El cliente no existe o está inactivo.', 1;
+        IF EXISTS (SELECT 1
+                   FROM @detalle d
+                   LEFT JOIN fact.Producto p ON p.cod_producto = d.cod_producto AND p.ind_estado = 'A'
+                   WHERE p.cod_producto IS NULL)
+            THROW 50012, N'Hay productos inexistentes o inactivos en el detalle.', 1;
+
+        BEGIN TRAN;
+
+        INSERT INTO fact.Factura (cod_cliente, ind_condicion_venta, ind_medio_pago, cod_moneda, mon_tipo_cambio, des_observaciones)
+        VALUES (@cod_cliente, @ind_condicion_venta, @ind_medio_pago, @cod_moneda, @mon_tipo_cambio, @des_observaciones);
+        SET @num_factura = SCOPE_IDENTITY();
+
+        ;WITH l AS
+        (
+            SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS num_linea,
+                   d.cod_producto, d.num_cantidad,
+                   CONVERT(DECIMAL(18,2), ROUND(d.num_cantidad * p.mon_precio, 2)) AS mon_linea
+            FROM @detalle d
+            JOIN fact.Producto p ON p.cod_producto = d.cod_producto
+        )
+        INSERT INTO fact.FacturaDetalle (num_factura, num_linea, cod_producto, num_cantidad, mon_linea)
+        SELECT @num_factura, num_linea, cod_producto, num_cantidad, mon_linea FROM l;
+
+        UPDATE f
+           SET mon_subtotal        = t.sub,
+               mon_total_impuestos = t.imp,
+               mon_total           = t.sub + t.imp
+        FROM fact.Factura f
+        CROSS APPLY (SELECT SUM(d.mon_linea) AS sub,
+                            SUM(CONVERT(DECIMAL(18,2), ROUND(d.mon_linea * ti.por_impuesto / 100.0, 2))) AS imp
+                     FROM fact.FacturaDetalle d
+                     JOIN fact.Producto p       ON p.cod_producto = d.cod_producto
+                     JOIN fact.TipoImpuesto ti  ON ti.cod_tipo_impuesto = p.cod_tipo_impuesto
+                     WHERE d.num_factura = f.num_factura) t
+        WHERE f.num_factura = @num_factura;
+
+        COMMIT;
+        SELECT @num_factura AS num_factura;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Factura_Obtener
+    @num_factura INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        -- Resultado 1: encabezado
+        SELECT f.num_factura, f.cod_cliente, c.nom_cliente, f.fec_factura,
+               f.ind_condicion_venta, f.ind_medio_pago, f.cod_moneda, f.mon_tipo_cambio,
+               f.des_observaciones, f.mon_subtotal, f.mon_total_impuestos, f.mon_total
+        FROM fact.Factura f
+        JOIN fact.Cliente c ON c.cod_cliente = f.cod_cliente
+        WHERE f.num_factura = @num_factura;
+
+        -- Resultado 2: detalle
+        SELECT d.num_linea, d.cod_producto, p.cod_cabys, p.des_producto,
+               d.num_cantidad, p.mon_precio, d.mon_linea
+        FROM fact.FacturaDetalle d
+        JOIN fact.Producto p ON p.cod_producto = d.cod_producto
+        WHERE d.num_factura = @num_factura
+        ORDER BY d.num_linea;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Factura_Listar
+    @fec_desde DATE = NULL,
+    @fec_hasta DATE = NULL
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        SELECT f.num_factura, f.cod_cliente, c.nom_cliente, f.fec_factura,
+               f.ind_condicion_venta, f.ind_medio_pago, f.cod_moneda,
+               f.mon_subtotal, f.mon_total_impuestos, f.mon_total
+        FROM fact.Factura f
+        JOIN fact.Cliente c ON c.cod_cliente = f.cod_cliente
+        WHERE (@fec_desde IS NULL OR f.fec_factura >= @fec_desde)
+          AND (@fec_hasta IS NULL OR f.fec_factura <  DATEADD(DAY, 1, @fec_hasta))
+        ORDER BY f.fec_factura DESC, f.num_factura DESC;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Factura_Eliminar
+    @num_factura INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        IF EXISTS (SELECT 1 FROM fact.NotaCreditoDebito WHERE num_factura = @num_factura)
+            THROW 50003, N'No se puede eliminar: la factura tiene notas de crédito/débito.', 1;
+        BEGIN TRAN;
+        DELETE FROM fact.FacturaDetalle WHERE num_factura = @num_factura;
+        DELETE FROM fact.Factura        WHERE num_factura = @num_factura;
+        IF @@ROWCOUNT = 0 THROW 50004, N'La factura no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+/* =====================================================================
+   NOTAS DE CRÉDITO / DÉBITO
+   ===================================================================== */
+CREATE OR ALTER PROCEDURE app.usp_Nota_Insertar
+    @num_factura INT,
+    @ind_tipo    CHAR(1),
+    @des_motivo  VARCHAR(300),
+    @cod_nota    INT = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        IF NOT EXISTS (SELECT 1 FROM fact.Factura WHERE num_factura = @num_factura)
+            THROW 50004, N'La factura indicada no existe.', 1;
+        BEGIN TRAN;
+        INSERT INTO fact.NotaCreditoDebito (num_factura, ind_tipo, des_motivo)
+        VALUES (@num_factura, @ind_tipo, @des_motivo);
+        SET @cod_nota = SCOPE_IDENTITY();
+        COMMIT;
+        SELECT @cod_nota AS cod_nota;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Nota_Actualizar
+    @cod_nota   INT,
+    @ind_tipo   CHAR(1),
+    @des_motivo VARCHAR(300)
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        UPDATE fact.NotaCreditoDebito SET ind_tipo = @ind_tipo, des_motivo = @des_motivo WHERE cod_nota = @cod_nota;
+        IF @@ROWCOUNT = 0 THROW 50004, N'La nota no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Nota_Eliminar
+    @cod_nota INT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRAN;
+        DELETE FROM fact.NotaCreditoDebito WHERE cod_nota = @cod_nota;
+        IF @@ROWCOUNT = 0 THROW 50004, N'La nota no existe.', 1;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE app.usp_Nota_Listar
+    @num_factura INT = NULL         -- NULL = todas
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        SELECT n.cod_nota, n.fec_nota, n.num_factura, n.ind_tipo, n.des_motivo
+        FROM fact.NotaCreditoDebito n
+        WHERE @num_factura IS NULL OR n.num_factura = @num_factura
+        ORDER BY n.fec_nota DESC, n.cod_nota DESC;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END
+GO
+
+PRINT '05_procedimientos_crud.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 06_procedimientos_reportes.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 06_procedimientos_reportes.sql
+   Propósito: Los 4 reportes del REQ 007, como procedimientos almacenados
+              con TRY...CATCH, transacción y documentación técnica.
+   Idempotente: CREATE OR ALTER.
+
+   NIVEL DE AISLAMIENTO (justificación para REQ 007)
+     Se usa SNAPSHOT (con READ_COMMITTED_SNAPSHOT también activo en la BD):
+       + Los reportes leen una foto consistente de los datos al iniciar la
+         transacción, sin lecturas sucias ni lecturas no repetibles.
+       + No toman bloqueos compartidos: no frenan a quien factura ni son
+         frenados por escrituras (lectores y escritores no se bloquean).
+       - Costo: el almacén de versiones consume espacio en tempdb.
+     Alternativas descartadas: READ UNCOMMITTED (lecturas sucias, inaceptable
+     en facturación/auditoría) y SERIALIZABLE (bloqueos de rango innecesarios
+     para reportes de solo lectura).
+
+   Rendimiento: los filtros por fecha son SARGables
+     (col >= @desde AND col < DATEADD(DAY,1,@hasta)), nunca CONVERT(col).
+     Los índices que los aprovechan se crean en 08_indices.sql (REQ 009).
+
+   Nota: la clave simétrica se abre ANTES de iniciar la transacción
+   (el estado de la clave es de sesión, no transaccional).
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+/* ---------------------------------------------------------------------
+   1) Reporte de Clientes Resumido
+   Entrada : @fec_desde, @fec_hasta (fecha de registro del cliente),
+             @ind_estado  A = activos, I = inactivos, T = todos
+   Salida  : nombre, identificación, actividad económica, correo, teléfono
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE app.usp_Reporte_ClientesResumido
+    @fec_desde  DATE,
+    @fec_hasta  DATE,
+    @ind_estado CHAR(1) = 'T'
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+    BEGIN TRY
+        IF @fec_desde > @fec_hasta THROW 50020, N'La fecha desde no puede ser mayor que la fecha hasta.', 1;
+        IF @ind_estado NOT IN ('A', 'I', 'T') THROW 50021, N'Estado inválido. Use A, I o T (todos).', 1;
+
+        OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+        BEGIN TRAN;
+
+        SELECT c.nom_cliente                                                AS nombre,
+               CONVERT(VARCHAR(50),  DECRYPTBYKEY(c.num_identificacion_cif)) AS num_identificacion,
+               c.des_actividad_economica                                    AS actividad_economica,
+               CONVERT(VARCHAR(250), DECRYPTBYKEY(c.des_correo_cif))        AS correo,
+               CONVERT(VARCHAR(30),  DECRYPTBYKEY(c.num_telefono_cif))      AS telefono
+        FROM fact.Cliente c
+        WHERE c.fec_registro >= @fec_desde
+          AND c.fec_registro <  DATEADD(DAY, 1, @fec_hasta)
+          AND (@ind_estado = 'T' OR c.ind_estado = @ind_estado)
+        ORDER BY c.nom_cliente;
+
+        COMMIT;
+        CLOSE SYMMETRIC KEY sk_Propi_Datos;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        IF EXISTS (SELECT 1 FROM sys.openkeys WHERE key_name = N'sk_Propi_Datos')
+            CLOSE SYMMETRIC KEY sk_Propi_Datos;
+        THROW;
+    END CATCH
+END
+GO
+
+/* ---------------------------------------------------------------------
+   2) Reporte de Facturas
+   Entrada : @fec_desde, @fec_hasta (fecha de la factura)
+   Salida  : cliente, identificación, actividad, nº factura, fecha,
+             subtotal, total impuestos, total
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE app.usp_Reporte_Facturas
+    @fec_desde DATE,
+    @fec_hasta DATE
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+    BEGIN TRY
+        IF @fec_desde > @fec_hasta THROW 50020, N'La fecha desde no puede ser mayor que la fecha hasta.', 1;
+
+        OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+        BEGIN TRAN;
+
+        SELECT c.nom_cliente                                                AS nombre_cliente,
+               CONVERT(VARCHAR(50), DECRYPTBYKEY(c.num_identificacion_cif)) AS num_identificacion,
+               c.des_actividad_economica                                    AS actividad_economica,
+               f.num_factura,
+               f.fec_factura                                                AS fecha,
+               f.mon_subtotal                                               AS subtotal,
+               f.mon_total_impuestos                                        AS total_impuestos,
+               f.mon_total                                                  AS total_factura
+        FROM fact.Factura f
+        JOIN fact.Cliente c ON c.cod_cliente = f.cod_cliente
+        WHERE f.fec_factura >= @fec_desde
+          AND f.fec_factura <  DATEADD(DAY, 1, @fec_hasta)
+        ORDER BY f.fec_factura, f.num_factura;
+
+        COMMIT;
+        CLOSE SYMMETRIC KEY sk_Propi_Datos;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        IF EXISTS (SELECT 1 FROM sys.openkeys WHERE key_name = N'sk_Propi_Datos')
+            CLOSE SYMMETRIC KEY sk_Propi_Datos;
+        THROW;
+    END CATCH
+END
+GO
+
+/* ---------------------------------------------------------------------
+   3) Reporte de Pistas de Auditoría
+   Entrada : @fec_desde, @fec_hasta (fecha de registro en bitácora),
+             @usuario  (NULL o vacío = todos)
+   Salida  : fecha, acción, usuario, tabla, llave, datos afectados
+             (en update, des_datos trae {"ANTES":{..},"DESPUES":{..}})
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE app.usp_Reporte_PistasAuditoria
+    @fec_desde DATE,
+    @fec_hasta DATE,
+    @usuario   VARCHAR(128) = NULL
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+    BEGIN TRY
+        IF @fec_desde > @fec_hasta THROW 50020, N'La fecha desde no puede ser mayor que la fecha hasta.', 1;
+        SET @usuario = NULLIF(LTRIM(RTRIM(@usuario)), '');
+
+        BEGIN TRAN;
+
+        SELECT a.fec_registro,
+               CASE a.ind_accion WHEN 'I' THEN N'Inserción'
+                                 WHEN 'D' THEN N'Borrado'
+                                 WHEN 'U' THEN N'Modificación' END AS accion,
+               a.cod_usuario  AS nombre_usuario,
+               a.cod_tabla    AS tabla_afectada,
+               a.cod_llave    AS llave_registro,
+               a.des_datos    AS datos_afectados
+        FROM aud.BitacoraAuditoria a
+        WHERE a.fec_registro >= @fec_desde
+          AND a.fec_registro <  DATEADD(DAY, 1, @fec_hasta)
+          AND (@usuario IS NULL OR a.cod_usuario = @usuario)
+        ORDER BY a.fec_registro DESC;
+
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+/* ---------------------------------------------------------------------
+   4) Reporte de Configuración de Seguridad
+   Entrada : @usuario (NULL o vacío = todos)
+   Salida  : usuario, rol, objeto, tipo de objeto, permiso, estado
+   Qué hace: une usuarios -> roles a los que pertenecen -> permisos del rol
+             (y los permisos directos del usuario). Los permisos concedidos
+             sobre un ESQUEMA se expanden a los objetos que contiene.
+             estado_permiso = GRANT / DENY.
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE app.usp_Reporte_ConfiguracionSeguridad
+    @usuario SYSNAME = NULL
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+    BEGIN TRY
+        SET @usuario = NULLIF(LTRIM(RTRIM(@usuario)), '');
+
+        BEGIN TRAN;
+
+        ;WITH usuarios AS
+        (
+            SELECT principal_id, name
+            FROM sys.database_principals
+            WHERE type IN ('S', 'U')                       -- usuarios SQL / Windows
+              AND name NOT IN (N'dbo', N'guest', N'INFORMATION_SCHEMA', N'sys')
+              AND (@usuario IS NULL OR name = @usuario)
+        ),
+        efectivos AS
+        (
+            SELECT u.name AS usuario, r.name AS rol, r.principal_id AS grantee_id
+            FROM usuarios u
+            JOIN sys.database_role_members m ON m.member_principal_id = u.principal_id
+            JOIN sys.database_principals  r  ON r.principal_id = m.role_principal_id
+            UNION ALL
+            SELECT u.name, N'(permiso directo)', u.principal_id
+            FROM usuarios u
+        )
+        SELECT e.usuario                                   AS nombre_usuario,
+               e.rol                                       AS rol,
+               o.name                                      AS nombre_objeto,
+               SCHEMA_NAME(o.schema_id)                    AS esquema,
+               CASE o.type WHEN 'U'  THEN N'Tabla'
+                           WHEN 'P'  THEN N'Procedimiento'
+                           WHEN 'V'  THEN N'Vista'
+                           WHEN 'FN' THEN N'Función'
+                           WHEN 'IF' THEN N'Función'
+                           WHEN 'TF' THEN N'Función' END   AS tipo_objeto,
+               CASE p.permission_name WHEN 'SELECT'  THEN N'Selección'
+                                      WHEN 'INSERT'  THEN N'Inserción'
+                                      WHEN 'DELETE'  THEN N'Borrado'
+                                      WHEN 'UPDATE'  THEN N'Modificación'
+                                      WHEN 'EXECUTE' THEN N'Execute' END AS tipo_permiso,
+               p.state_desc                                AS estado_permiso
+        FROM efectivos e
+        JOIN sys.database_permissions p
+              ON p.grantee_principal_id = e.grantee_id
+             AND p.class IN (1, 3)                          -- 1 objeto, 3 esquema
+             AND p.minor_id = 0
+             AND p.permission_name IN ('SELECT', 'INSERT', 'DELETE', 'UPDATE', 'EXECUTE')
+             AND p.state IN ('G', 'W', 'D')
+        JOIN sys.objects o
+              ON o.is_ms_shipped = 0
+             AND o.type IN ('U', 'P', 'V', 'FN', 'IF', 'TF')
+             AND ( (p.class = 1 AND o.object_id = p.major_id)
+                OR (p.class = 3 AND o.schema_id = p.major_id) )
+        ORDER BY e.usuario, e.rol, SCHEMA_NAME(o.schema_id), o.name, p.permission_name;
+
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
+END
+GO
+
+PRINT '06_procedimientos_reportes.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 07_roles_logins_permisos.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 07_roles_logins_permisos.sql
+   Propósito: Seguridad por roles (REQ 003, 004 y 008):
+              roles -> logins/usuarios de prueba -> GRANT / REVOKE / DENY.
+   Idempotente.
+
+   Modelo
+     rol_administrador : acceso total a la información (lectura/escritura a
+                         fact y seg, lectura de aud) y a todos los procedimientos.
+     rol_digitador     : ingreso de clientes, facturas y notas. Sin borrados,
+                         sin catálogos, sin reportes de seguridad/auditoría.
+     rol_consulta      : solo reportería (4 reportes).
+   Los usuarios NO tienen acceso a tablas: solo EXECUTE sobre procedimientos
+   (el encadenamiento de propiedad dbo permite que los procedimientos lean/escriban).
+   La bitácora de auditoría es de solo inserción para TODOS (DENY a nivel de rol
+   + trigger INSTEAD OF en 04); los triggers insertan por encadenamiento.
+
+   REQUISITOS
+     - La instancia debe estar en modo de autenticación mixto (SQL + Windows)
+       para que los logins SQL puedan conectarse.
+     - Las contraseñas de abajo son SOLO de desarrollo (documentar en REQ 012).
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+/* ---------------------------------------------------------------------
+   1) Roles de base de datos
+   --------------------------------------------------------------------- */
+IF DATABASE_PRINCIPAL_ID(N'rol_administrador') IS NULL CREATE ROLE rol_administrador AUTHORIZATION dbo;
+IF DATABASE_PRINCIPAL_ID(N'rol_digitador')     IS NULL CREATE ROLE rol_digitador     AUTHORIZATION dbo;
+IF DATABASE_PRINCIPAL_ID(N'rol_consulta')      IS NULL CREATE ROLE rol_consulta      AUTHORIZATION dbo;
+GO
+
+/* ---------------------------------------------------------------------
+   2) Logins (servidor) y usuarios (base de datos) de prueba
+   --------------------------------------------------------------------- */
+USE master;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'propi_admin')
+    CREATE LOGIN propi_admin      WITH PASSWORD = N'Propi_Admin#2026!',      CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_DATABASE = PropiFacturacion;
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'propi_digitador')
+    CREATE LOGIN propi_digitador  WITH PASSWORD = N'Propi_Digitador#2026!',  CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_DATABASE = PropiFacturacion;
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'propi_consulta')
+    CREATE LOGIN propi_consulta   WITH PASSWORD = N'Propi_Consulta#2026!',   CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_DATABASE = PropiFacturacion;
+GO
+
+USE PropiFacturacion;
+GO
+IF DATABASE_PRINCIPAL_ID(N'propi_admin')     IS NULL CREATE USER propi_admin     FOR LOGIN propi_admin;
+IF DATABASE_PRINCIPAL_ID(N'propi_digitador') IS NULL CREATE USER propi_digitador FOR LOGIN propi_digitador;
+IF DATABASE_PRINCIPAL_ID(N'propi_consulta')  IS NULL CREATE USER propi_consulta  FOR LOGIN propi_consulta;
+GO
+
+IF IS_ROLEMEMBER(N'rol_administrador', N'propi_admin')     = 0 ALTER ROLE rol_administrador ADD MEMBER propi_admin;
+IF IS_ROLEMEMBER(N'rol_digitador',     N'propi_digitador') = 0 ALTER ROLE rol_digitador     ADD MEMBER propi_digitador;
+IF IS_ROLEMEMBER(N'rol_consulta',      N'propi_consulta')  = 0 ALTER ROLE rol_consulta      ADD MEMBER propi_consulta;
+GO
+
+/* ---------------------------------------------------------------------
+   3) rol_administrador : acceso total
+   --------------------------------------------------------------------- */
+GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::fact TO rol_administrador;
+GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::seg  TO rol_administrador;
+GRANT SELECT                         ON SCHEMA::aud  TO rol_administrador;
+GRANT EXECUTE                        ON SCHEMA::app  TO rol_administrador;
+GRANT EXECUTE ON TYPE::app.TD_FacturaDetalle TO rol_administrador;
+-- La bitácora de auditoría no se puede alterar ni por el administrador
+DENY INSERT, UPDATE, DELETE ON SCHEMA::aud TO rol_administrador;
+GO
+
+/* ---------------------------------------------------------------------
+   4) rol_digitador y rol_consulta : cero acceso directo a tablas
+      (REVOKE limpia concesiones previas; DENY lo deja explícito)
+   --------------------------------------------------------------------- */
+REVOKE SELECT, INSERT, UPDATE, DELETE ON SCHEMA::fact FROM rol_digitador, rol_consulta;
+REVOKE SELECT, INSERT, UPDATE, DELETE ON SCHEMA::seg  FROM rol_digitador, rol_consulta;
+REVOKE SELECT, INSERT, UPDATE, DELETE ON SCHEMA::aud  FROM rol_digitador, rol_consulta;
+
+DENY SELECT, INSERT, UPDATE, DELETE ON SCHEMA::fact TO rol_digitador, rol_consulta;
+DENY SELECT, INSERT, UPDATE, DELETE ON SCHEMA::seg  TO rol_digitador, rol_consulta;
+DENY SELECT, INSERT, UPDATE, DELETE ON SCHEMA::aud  TO rol_digitador, rol_consulta;
+GO
+
+/* ---------------------------------------------------------------------
+   5) rol_digitador : clientes, facturas y notas (sin borrados)
+   --------------------------------------------------------------------- */
+-- Sesión
+GRANT EXECUTE ON app.usp_Acceso_Registrar TO rol_digitador;
+GRANT EXECUTE ON app.usp_Acceso_Cerrar    TO rol_digitador;
+-- Catálogos (solo lectura, para llenar combos y buscar productos)
+GRANT EXECUTE ON app.usp_TipoIdentificacion_Listar TO rol_digitador;
+GRANT EXECUTE ON app.usp_TipoImpuesto_Listar       TO rol_digitador;
+GRANT EXECUTE ON app.usp_Producto_Listar           TO rol_digitador;
+GRANT EXECUTE ON app.usp_Producto_Obtener          TO rol_digitador;
+-- Clientes
+GRANT EXECUTE ON app.usp_Cliente_Insertar   TO rol_digitador;
+GRANT EXECUTE ON app.usp_Cliente_Actualizar TO rol_digitador;
+GRANT EXECUTE ON app.usp_Cliente_Obtener    TO rol_digitador;
+GRANT EXECUTE ON app.usp_Cliente_Listar     TO rol_digitador;
+-- Facturas
+GRANT EXECUTE ON app.usp_Factura_Insertar TO rol_digitador;
+GRANT EXECUTE ON app.usp_Factura_Obtener  TO rol_digitador;
+GRANT EXECUTE ON app.usp_Factura_Listar   TO rol_digitador;
+GRANT EXECUTE ON TYPE::app.TD_FacturaDetalle TO rol_digitador;
+-- Notas
+GRANT EXECUTE ON app.usp_Nota_Insertar TO rol_digitador;
+GRANT EXECUTE ON app.usp_Nota_Listar   TO rol_digitador;
+-- Prohibiciones explícitas (DENY gana sobre cualquier GRANT heredado)
+DENY EXECUTE ON app.usp_Cliente_Eliminar      TO rol_digitador;
+DENY EXECUTE ON app.usp_Cliente_CambiarEstado TO rol_digitador;
+DENY EXECUTE ON app.usp_Factura_Eliminar      TO rol_digitador;
+DENY EXECUTE ON app.usp_Nota_Eliminar         TO rol_digitador;
+DENY EXECUTE ON app.usp_Reporte_PistasAuditoria         TO rol_digitador;
+DENY EXECUTE ON app.usp_Reporte_ConfiguracionSeguridad  TO rol_digitador;
+GO
+
+/* ---------------------------------------------------------------------
+   6) rol_consulta : solo reportería
+      (decisión: los 4 reportes; si se prefiere ocultar los de seguridad
+       y auditoría, basta con un REVOKE sobre esos dos procedimientos)
+   --------------------------------------------------------------------- */
+GRANT EXECUTE ON app.usp_Acceso_Registrar TO rol_consulta;
+GRANT EXECUTE ON app.usp_Acceso_Cerrar    TO rol_consulta;
+GRANT EXECUTE ON app.usp_Reporte_ClientesResumido        TO rol_consulta;
+GRANT EXECUTE ON app.usp_Reporte_Facturas                TO rol_consulta;
+GRANT EXECUTE ON app.usp_Reporte_PistasAuditoria         TO rol_consulta;
+GRANT EXECUTE ON app.usp_Reporte_ConfiguracionSeguridad  TO rol_consulta;
+GO
+
+PRINT '07_roles_logins_permisos.sql finalizado.';
+GO
+
+/* >>>>>>>>>> 09_datos_prueba.sql <<<<<<<<<< */
+/* =====================================================================
+   Proyecto : Sistema de Gestión de Facturación Propi
+   Script   : 09_datos_prueba.sql
+   Propósito: Carga datos sintéticos para validar la optimización (REQ 009).
+              Cada bloque se salta si su tabla ya tiene datos (idempotente).
+
+   Volumen  : Cliente 1,000 · Producto 1,000 · Factura 1,000 (~2,500 líneas)
+              NotaCreditoDebito 1,000 · BitacoraAcceso 1,000
+              + la bitácora de auditoría se llena sola vía triggers.
+   Catálogos: TipoIdentificacion (4) y TipoImpuesto (5) son catálogos
+              pequeños por naturaleza; no tiene sentido inflarlos a 1,000.
+
+   Los clientes se cifran con la clave de ESTA máquina (REQ 006); por eso
+   los datos de prueba se generan aquí y no se mueven entre equipos.
+   IMPORTANTE para REQ 009: ejecutar este script ANTES de 08_indices.sql,
+   medir los planes "antes", y luego crear los índices y medir "después".
+   ===================================================================== */
+USE PropiFacturacion;
+GO
+IF DB_NAME() <> N'PropiFacturacion'
+BEGIN
+    PRINT N'ERROR: no se pudo usar PropiFacturacion. Se detiene el resto del script.';
+    SET NOEXEC ON;
+END
+GO
+SET NOCOUNT ON;
+GO
+
+/* ---------------------------------------------------------------------
+   Clientes (cifrados)
+   --------------------------------------------------------------------- */
+IF NOT EXISTS (SELECT 1 FROM fact.Cliente)
+BEGIN
+    OPEN SYMMETRIC KEY sk_Propi_Datos DECRYPTION BY CERTIFICATE cert_Propi_Datos;
+
+    ;WITH n AS
+    (
+        SELECT TOP (1000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+        FROM sys.all_objects a CROSS JOIN sys.all_objects b
+    ),
+    d AS
+    (
+        SELECT n,
+               CONVERT(TINYINT, CASE WHEN n % 5 = 0 THEN 2 ELSE 1 END) AS tipo,
+               CONCAT(1 + n % 9, '-', RIGHT('0000' + CONVERT(VARCHAR(10), 1000 + n), 4), '-',
+                      RIGHT('0000' + CONVERT(VARCHAR(10), (n * 7) % 10000), 4)) AS ident
+        FROM n
+    )
+    INSERT INTO fact.Cliente
+        (nom_cliente, cod_tipo_identificacion, num_identificacion_cif, hash_identificacion,
+         nom_provincia, nom_canton, nom_distrito, nom_barrio, des_profesion, des_actividad_economica,
+         des_correo_cif, num_telefono_cif, fec_registro, ind_estado)
+    SELECT
+        CASE WHEN d.tipo = 2
+             THEN CONCAT(CHOOSE(d.n % 6 + 1, 'Inversiones', 'Constructora', 'Desarrollos', 'Servicios', 'Grupo', 'Inmobiliaria'),
+                         ' ', CHOOSE(d.n % 7 + 1, 'Cartago', 'Orosi', 'Tierra Blanca', 'Del Valle', 'Paraíso', 'Los Ángeles', 'Pacayas'),
+                         ' S.A. #', d.n)
+             ELSE CONCAT(CHOOSE(d.n % 10 + 1, 'María', 'José', 'Ana', 'Carlos', 'Laura', 'Luis', 'Sofía', 'Diego', 'Valeria', 'Andrés'), ' ',
+                         CHOOSE((d.n / 10) % 10 + 1, 'Mora', 'Solano', 'Vargas', 'Rojas', 'Jiménez', 'Araya', 'Calvo', 'Chaves', 'Quesada', 'Brenes'), ' ',
+                         CHOOSE((d.n / 3) % 8 + 1, 'Cordero', 'Fallas', 'Núñez', 'Salas', 'Ulate', 'Mata', 'Villalobos', 'Zúñiga'))
+        END,
+        d.tipo,
+        ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), d.ident)),
+        HASHBYTES('SHA2_256', CONCAT(d.tipo, '|', UPPER(REPLACE(d.ident, '-', '')))),
+        CHOOSE(d.n % 7 + 1, 'Cartago', 'Cartago', 'Cartago', 'San José', 'Heredia', 'Alajuela', 'Limón'),
+        CHOOSE(d.n % 7 + 1, 'Paraíso', 'Cartago', 'Jiménez', 'Escazú', 'Heredia', 'Alajuela', 'Limón'),
+        CHOOSE(d.n % 7 + 1, 'Orosi', 'Oriental', 'Juan Viñas', 'San Rafael', 'Mercedes', 'San José', 'Valle La Estrella'),
+        CASE WHEN d.n % 4 = 0 THEN NULL ELSE CONCAT('Barrio ', CHOOSE(d.n % 5 + 1, 'Centro', 'Los Pinos', 'La Esperanza', 'San Martín', 'El Carmen')) END,
+        CHOOSE(d.n % 6 + 1, 'Ingeniero', 'Docente', 'Comerciante', 'Médico', 'Contador', 'Abogado'),
+        CHOOSE(d.n % 6 + 1, 'Servicios profesionales', 'Educación', 'Comercio al por menor', 'Salud humana', 'Contabilidad', 'Actividades jurídicas'),
+        ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(250), CONCAT('cliente', d.n, '@propi-demo.cr'))),
+        ENCRYPTBYKEY(KEY_GUID(N'sk_Propi_Datos'), CONVERT(VARCHAR(150), CONCAT('8', RIGHT('0000000' + CONVERT(VARCHAR(10), 1000000 + d.n * 37), 7)))),
+        DATEADD(MINUTE, -(d.n * 13) % 1440, DATEADD(DAY, -(d.n % 365), GETDATE())),
+        CASE WHEN d.n % 10 = 0 THEN 'I' ELSE 'A' END
+    FROM d;
+
+    CLOSE SYMMETRIC KEY sk_Propi_Datos;
+    PRINT 'Clientes de prueba cargados.';
+END
+ELSE PRINT 'Clientes: ya había datos, se omite.';
+GO
+
+/* ---------------------------------------------------------------------
+   Productos / servicios
+   --------------------------------------------------------------------- */
+IF NOT EXISTS (SELECT 1 FROM fact.Producto)
+BEGIN
+    DECLARE @nImp INT = (SELECT COUNT(*) FROM fact.TipoImpuesto);
+
+    ;WITH n AS
+    (
+        SELECT TOP (1000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+        FROM sys.all_objects a CROSS JOIN sys.all_objects b
+    )
+    INSERT INTO fact.Producto (cod_cabys, des_producto, des_unidad_medida, mon_precio, cod_tipo_impuesto, ind_estado)
+    SELECT
+        RIGHT('0000000000000' + CONVERT(VARCHAR(20), 4000000000000 + n.n * 13), 13),
+        CONCAT(CHOOSE(n.n % 8 + 1, 'Lote residencial', 'Apartamento', 'Casa de habitación', 'Local comercial',
+                                   'Comisión por venta', 'Asesoría inmobiliaria', 'Avalúo', 'Alquiler mensual'), ' #', n.n),
+        CHOOSE(n.n % 3 + 1, 'Unid', 'Sp', 'm2'),
+        CONVERT(DECIMAL(18,2), 25000 + (n.n * 977) % 4975000 + (n.n % 100) / 100.0),
+        (SELECT ti.cod_tipo_impuesto
+         FROM fact.TipoImpuesto ti
+         ORDER BY ti.cod_tipo_impuesto
+         OFFSET (n.n % @nImp) ROWS FETCH NEXT 1 ROWS ONLY),
+        CASE WHEN n.n % 25 = 0 THEN 'I' ELSE 'A' END
+    FROM n;
+
+    PRINT 'Productos de prueba cargados.';
+END
+ELSE PRINT 'Productos: ya había datos, se omite.';
+GO
+
+/* ---------------------------------------------------------------------
+   Facturas: encabezado -> detalle -> recalculo de totales
+   (misma fórmula que app.usp_Factura_Insertar)
+   --------------------------------------------------------------------- */
+IF NOT EXISTS (SELECT 1 FROM fact.Factura)
+BEGIN
+    DECLARE @nCli INT = (SELECT COUNT(*) FROM fact.Cliente WHERE ind_estado = 'A');
+
+    ;WITH n AS
+    (
+        SELECT TOP (1000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+        FROM sys.all_objects a CROSS JOIN sys.all_objects b
+    )
+    INSERT INTO fact.Factura (cod_cliente, fec_factura, ind_condicion_venta, ind_medio_pago, cod_moneda, mon_tipo_cambio, des_observaciones)
+    SELECT
+        (SELECT c.cod_cliente FROM fact.Cliente c WHERE c.ind_estado = 'A'
+         ORDER BY c.cod_cliente OFFSET ((n.n * 7) % @nCli) ROWS FETCH NEXT 1 ROWS ONLY),
+        DATEADD(MINUTE, -(n.n * 17) % 1440, DATEADD(DAY, -(n.n % 120), GETDATE())),
+        CASE WHEN n.n % 3 = 0 THEN 'R' ELSE 'C' END,
+        CHOOSE(n.n % 6 + 1, 'E', 'T', 'Q', 'F', 'S', 'O'),
+        CASE WHEN n.n % 10 = 0 THEN 'USD' ELSE 'CRC' END,
+        CASE WHEN n.n % 10 = 0 THEN 515.5000 ELSE 1.0000 END,
+        CONCAT('Carga demo #', n.n)
+    FROM n;
+
+    -- Detalle: de 1 a 4 líneas por factura
+    DECLARE @nProd INT = (SELECT COUNT(*) FROM fact.Producto WHERE ind_estado = 'A');
+
+    ;WITH f AS
+    (
+        SELECT num_factura, ROW_NUMBER() OVER (ORDER BY num_factura) AS rn
+        FROM fact.Factura
+        WHERE des_observaciones LIKE 'Carga demo #%'
+    ),
+    l AS
+    (
+        SELECT f.num_factura, f.rn, v.num_linea
+        FROM f
+        CROSS APPLY (VALUES (1), (2), (3), (4)) v(num_linea)
+        WHERE v.num_linea <= 1 + (f.rn % 4)
+    ),
+    x AS
+    (
+        SELECT l.num_factura, l.num_linea,
+               (SELECT p.cod_producto FROM fact.Producto p WHERE p.ind_estado = 'A'
+                ORDER BY p.cod_producto OFFSET ((l.rn * l.num_linea * 11) % @nProd) ROWS FETCH NEXT 1 ROWS ONLY) AS cod_producto,
+               CONVERT(DECIMAL(12,2), 1 + ((l.rn + l.num_linea) % 5)) AS num_cantidad
+        FROM l
+    )
+    INSERT INTO fact.FacturaDetalle (num_factura, num_linea, cod_producto, num_cantidad, mon_linea)
+    SELECT x.num_factura, x.num_linea, x.cod_producto, x.num_cantidad,
+           CONVERT(DECIMAL(18,2), ROUND(x.num_cantidad * p.mon_precio, 2))
+    FROM x
+    JOIN fact.Producto p ON p.cod_producto = x.cod_producto;
+
+    -- Totales
+    UPDATE f
+       SET mon_subtotal        = t.sub,
+           mon_total_impuestos = t.imp,
+           mon_total           = t.sub + t.imp
+    FROM fact.Factura f
+    CROSS APPLY (SELECT SUM(d.mon_linea) AS sub,
+                        SUM(CONVERT(DECIMAL(18,2), ROUND(d.mon_linea * ti.por_impuesto / 100.0, 2))) AS imp
+                 FROM fact.FacturaDetalle d
+                 JOIN fact.Producto p      ON p.cod_producto = d.cod_producto
+                 JOIN fact.TipoImpuesto ti ON ti.cod_tipo_impuesto = p.cod_tipo_impuesto
+                 WHERE d.num_factura = f.num_factura) t
+    WHERE f.des_observaciones LIKE 'Carga demo #%';
+
+    PRINT 'Facturas y detalle de prueba cargados.';
+END
+ELSE PRINT 'Facturas: ya había datos, se omite.';
+GO
+
+/* ---------------------------------------------------------------------
+   Notas de crédito / débito
+   --------------------------------------------------------------------- */
+IF NOT EXISTS (SELECT 1 FROM fact.NotaCreditoDebito)
+BEGIN
+    DECLARE @nFac INT = (SELECT COUNT(*) FROM fact.Factura);
+
+    ;WITH n AS
+    (
+        SELECT TOP (1000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+        FROM sys.all_objects a CROSS JOIN sys.all_objects b
+    )
+    INSERT INTO fact.NotaCreditoDebito (fec_nota, num_factura, ind_tipo, des_motivo)
+    SELECT
+        DATEADD(MINUTE, -(n.n * 19) % 1440, DATEADD(DAY, -(n.n % 90), GETDATE())),
+        (SELECT f.num_factura FROM fact.Factura f
+         ORDER BY f.num_factura OFFSET ((n.n * 3) % @nFac) ROWS FETCH NEXT 1 ROWS ONLY),
+        CASE WHEN n.n % 3 = 0 THEN 'D' ELSE 'C' END,
+        CHOOSE(n.n % 5 + 1, 'Devolución parcial', 'Error en el precio', 'Descuento posterior a la venta',
+                            'Cargo por intereses de mora', 'Corrección de cantidad')
+    FROM n;
+
+    PRINT 'Notas de prueba cargadas.';
+END
+ELSE PRINT 'Notas: ya había datos, se omite.';
+GO
+
+/* ---------------------------------------------------------------------
+   Bitácora de acceso (datos históricos simulados)
+   --------------------------------------------------------------------- */
+IF NOT EXISTS (SELECT 1 FROM seg.BitacoraAcceso)
+BEGIN
+    ;WITH n AS
+    (
+        SELECT TOP (1000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+        FROM sys.all_objects a CROSS JOIN sys.all_objects b
+    ),
+    d AS
+    (
+        SELECT n.n, DATEADD(MINUTE, -(n.n * 29) % 1440, DATEADD(DAY, -(n.n % 60), GETDATE())) AS ingreso
+        FROM n
+    )
+    INSERT INTO seg.BitacoraAcceso (nom_usuario, nom_terminal, dir_ip, fec_ingreso, fec_salida, fec_registro)
+    SELECT CHOOSE(d.n % 3 + 1, 'propi_admin', 'propi_digitador', 'propi_consulta'),
+           CONCAT('PC-', RIGHT('000' + CONVERT(VARCHAR(5), d.n % 40), 3)),
+           CONCAT('192.168.1.', 10 + d.n % 200),
+           d.ingreso,
+           DATEADD(MINUTE, 5 + d.n % 120, d.ingreso),
+           d.ingreso
+    FROM d;
+
+    PRINT 'Bitácora de acceso de prueba cargada.';
+END
+ELSE PRINT 'BitacoraAcceso: ya había datos, se omite.';
+GO
+
+/* ---------------------------------------------------------------------
+   Resumen de volúmenes
+   --------------------------------------------------------------------- */
+SELECT s.name + N'.' + t.name AS tabla, SUM(p.rows) AS filas
+FROM sys.tables t
+JOIN sys.schemas s    ON s.schema_id = t.schema_id
+JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+GROUP BY s.name, t.name
+ORDER BY s.name, t.name;
+GO
+
+PRINT '09_datos_prueba.sql finalizado.';
+GO
+
+SET NOEXEC OFF;
+GO
+PRINT '=== Despliegue completo ===';
+GO
